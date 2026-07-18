@@ -4,13 +4,11 @@ Chạy demo: `uvicorn app.backend.api:app --reload` rồi mở http://localhost:
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 import sqlite3
 import uuid
-from datetime import date, datetime, timezone
-from pathlib import Path
+from datetime import date
 
 import httpx
 from dotenv import load_dotenv
@@ -22,6 +20,7 @@ from app.backend import (
     asr,
     clarifications,
     conversation_resolver,
+    handoff,
     history,
     image_resolver,
     image_uploads,
@@ -30,11 +29,10 @@ from app.backend import (
     registry_api,
     tts,
 )
+from app.backend.handoff import HANDOFF_DB  # re-export for backward-compatible tests
 from app.backend.schemas import (
     AskRequest,
     AskResponse,
-    HandoffRequest,
-    HandoffResponse,
     ImageUploadResponse,
     TranscribeResponse,
     TtsRequest,
@@ -42,9 +40,8 @@ from app.backend.schemas import (
 
 load_dotenv()
 
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
+BASE_DIR = __import__("pathlib").Path(__file__).resolve().parent.parent.parent
 WEB_DIR = BASE_DIR / "app" / "web"
-HANDOFF_DB = BASE_DIR / "data" / "handoff.db"
 
 TRANSCRIBE_UNAVAILABLE_MSG = "Dạ hiện em chưa nhận diện được giọng nói, bác gõ chữ giúp em nhé."
 TRANSCRIBE_FAILED_MSG = "Dạ em nhận diện giọng nói bị lỗi, bác thử lại hoặc gõ chữ giúp em nhé."
@@ -56,23 +53,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Trợ lý nông nghiệp — API v0")
 app.include_router(history.router)
 app.include_router(registry_api.router)
-
-
-def _handoff_conn() -> sqlite3.Connection:
-    HANDOFF_DB.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(HANDOFF_DB)
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS tickets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,
-            region TEXT,
-            transcript TEXT NOT NULL,
-            slots_json TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending'
-        )"""
-    )
-    conn.commit()
-    return conn
+app.include_router(handoff.router)
 
 
 @app.post("/api/ask", response_model=AskResponse)
@@ -111,11 +92,19 @@ def ask(req: AskRequest) -> AskResponse:
             )
         except sqlite3.Error:
             logger.exception("Could not persist conversation session context")
-        return AskResponse(
+        response = AskResponse(
             session_id=session_id,
             session_turn_limit=history.session_turn_limit(),
             **result,
         )
+        # Dashboard analytics are best-effort and must never block the answer.
+        handoff.log_question(
+            region=response.slots.region,
+            crop=response.slots.crop,
+            pest=response.slots.pest,
+            text=original_text,
+        )
+        return response
 
     if not text and not req.attachment_ids:
         raise HTTPException(status_code=422, detail="Bác nhập câu hỏi hoặc chọn ít nhất một ảnh nhé.")
@@ -257,24 +246,17 @@ async def synthesize_speech(req: TtsRequest) -> Response:
     )
 
 
-@app.post("/api/handoff", response_model=HandoffResponse)
-def handoff(req: HandoffRequest) -> HandoffResponse:
-    conn = _handoff_conn()
-    try:
-        cur = conn.execute(
-            "INSERT INTO tickets (ts, region, transcript, slots_json, status) VALUES (?, ?, ?, ?, 'pending')",
-            (
-                datetime.now(timezone.utc).isoformat(),
-                req.slots.region,
-                req.transcript,
-                json.dumps(req.slots.model_dump(), ensure_ascii=False),
-            ),
-        )
-        conn.commit()
-        ticket_id = cur.lastrowid
-    finally:
-        conn.close()
-    return HandoffResponse(ticket_id=ticket_id)
+# Trang landing ở "/" — app chat chuyển sang "/chat" (endpoint handoff cũ đã
+# chuyển vào app/backend/handoff.py router).
+@app.get("/")
+def landing():
+    return FileResponse(WEB_DIR / "landing.html")
+
+
+@app.get("/chat")
+def chat():
+    return FileResponse(WEB_DIR / "index.html")
+
 
 
 # Đăng ký API routes xong mới mount static — mount "/" chỉ bắt các path không khớp
