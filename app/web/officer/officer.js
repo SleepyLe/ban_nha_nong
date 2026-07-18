@@ -10,6 +10,7 @@ const REFRESH_INTERVAL_MS = 15000;
 const TOAST_DURATION_MS   = 4500;
 const TOAST_FADE_MS       = 280;
 const HISTORY_PAGE_SIZE   = 5;
+const ACTIVE_PAGE_SIZE    = 3;   // alert "Đang diễn ra" mỗi trang — tránh tràn dải
 
 const REGION_NAMES = {
   an_giang:        'An Giang',
@@ -83,6 +84,7 @@ const state = {
   activeTab:      'pending',   // tab ticket: 'pending' | 'answered'
   alertTab:       'active',    // tab alert: 'overview' | 'active' | 'history' — mặc định gọn để không che khu ticket
   historyPage:    0,
+  activePage:     0,
   analyticsYear: null,
   tickets:        [],
   selectedId:     null,
@@ -314,6 +316,7 @@ function buildAlertTabBar(activeCount, historyCount, overview) {
     btn.addEventListener('click', function () {
       state.alertTab = tabId;
       state.historyPage = tabId === 'history' ? state.historyPage : 0;
+      state.activePage  = tabId === 'active'  ? state.activePage  : 0;
       // Cập nhật active trên các nút trong tab bar này
       bar.querySelectorAll('.alert-tab-btn').forEach(function (b) {
         const isSelected = b.dataset.alertTab === tabId;
@@ -500,6 +503,8 @@ function buildRegionRanking(title, description, items, countField, unit, showOut
 }
 
 function buildActiveAlertsPanel(alerts, container) {
+  while (container.firstChild) container.removeChild(container.firstChild);
+
   if (!alerts || alerts.length === 0) {
     const row = document.createElement('div');
     row.className = 'alert-ok';
@@ -514,7 +519,13 @@ function buildActiveAlertsPanel(alerts, container) {
     return;
   }
 
-  alerts.forEach(function (alert, alertIndex) {
+  // Phân trang như tab Lịch sử — alert dài (mở "xem mẫu") không làm tràn dải
+  const pageCount = Math.max(1, Math.ceil(alerts.length / ACTIVE_PAGE_SIZE));
+  state.activePage = Math.min(Math.max(0, state.activePage), pageCount - 1);
+  const startIndex = state.activePage * ACTIVE_PAGE_SIZE;
+  const pageItems = alerts.slice(startIndex, startIndex + ACTIVE_PAGE_SIZE);
+
+  pageItems.forEach(function (alert, alertIndex) {
     const count      = alert.count || 0;
     const isHigh     = count >= 10;
     const hasSamples = alert.sample_questions && alert.sample_questions.length > 0;
@@ -565,7 +576,7 @@ function buildActiveAlertsPanel(alerts, container) {
     if (hasSamples) {
       const samplesEl = document.createElement('div');
       samplesEl.className = 'alert-samples';
-      samplesEl.id = 'alert-samples-' + alertIndex;
+      samplesEl.id = 'alert-samples-' + (startIndex + alertIndex);
       samplesEl.setAttribute('role', 'region');
       samplesEl.setAttribute('aria-label', 'Câu hỏi mẫu tại ' + regionName(alert.region));
       samplesEl.hidden = true;
@@ -590,6 +601,45 @@ function buildActiveAlertsPanel(alerts, container) {
 
     container.appendChild(row);
   });
+
+  if (alerts.length > ACTIVE_PAGE_SIZE) {
+    const pagination = document.createElement('div');
+    pagination.className = 'history-pagination';
+    pagination.setAttribute('aria-label', 'Phân trang cảnh báo đang diễn ra');
+
+    const rangeLabel = document.createElement('span');
+    rangeLabel.className = 'history-page-range';
+    rangeLabel.textContent = (startIndex + 1) + '–' + (startIndex + pageItems.length) + ' / ' + alerts.length;
+
+    const pageStatus = document.createElement('span');
+    pageStatus.className = 'history-page-status';
+    pageStatus.textContent = 'Trang ' + (state.activePage + 1) + ' / ' + pageCount;
+    pageStatus.setAttribute('aria-live', 'polite');
+
+    const actions = document.createElement('div');
+    actions.className = 'history-page-actions';
+
+    function makePageButton(label, delta, disabled) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'history-page-btn';
+      button.textContent = label;
+      button.disabled = disabled;
+      button.addEventListener('click', function () {
+        state.activePage += delta;
+        buildActiveAlertsPanel(alerts, container);
+      });
+      return button;
+    }
+
+    actions.appendChild(makePageButton('Trước', -1, state.activePage === 0));
+    actions.appendChild(makePageButton('Sau', 1, state.activePage >= pageCount - 1));
+
+    pagination.appendChild(rangeLabel);
+    pagination.appendChild(pageStatus);
+    pagination.appendChild(actions);
+    container.appendChild(pagination);
+  }
 }
 
 function buildHistoryPanel(history, container) {
