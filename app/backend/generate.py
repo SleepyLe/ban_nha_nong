@@ -3,14 +3,13 @@
 `generate_b_answer(question, chunks, region) -> dict` gọi Gemini với response schema
 JSON (text, citations, grounded) trên evidence = `chunks` (từ app/backend/retrieval.py).
 
-Model mặc định: `gemini-flash-lite-latest` (GEMINI_API_KEY hiện tại là free tier —
+Model mặc định: `gemini-3.1-flash-lite` (GEMINI_API_KEY hiện tại là free tier —
 chỉ đạo cập nhật giữa chừng task: dùng model rẻ/nhẹ nhất còn đủ chất lượng cho
 grounded QA có schema, KHÔNG dùng pro). LƯU Ý: chỉ đạo gốc yêu cầu `gemini-2.5-flash-lite`
 nhưng model đó trả 404 "no longer available to new users" với key thật đang dùng
-(xác nhận bằng lời gọi thật, xem report) — `gemini-flash-lite-latest` là alias
-Google luôn trỏ về model flash-lite khuyến nghị hiện hành, gọi được với key này
-(đã test: cũng OK với `gemini-3.1-flash-lite` cụ thể, nhưng dùng alias "-latest" để
-không phải sửa code mỗi khi Google đổi phiên bản). Override qua env
+(xác nhận bằng lời gọi thật). Pin `gemini-3.1-flash-lite` vì project hiện có
+quota 500 RPD cho model này; tránh alias `-latest` bị hot-swap sang model khác
+quota. Override qua env
 `GEMINI_GEN_MODEL` nếu cần cố định 1 phiên bản cụ thể.
 
 Hậu kiểm — P1-E: đã WIRE `app/backend/validators.py` (P1-A), thay cho hậu kiểm tự viết
@@ -54,7 +53,7 @@ from pydantic import BaseModel
 
 from app.backend import validators
 
-DEFAULT_GENERATE_MODEL = "gemini-flash-lite-latest"
+DEFAULT_GENERATE_MODEL = "gemini-3.1-flash-lite"
 TEMPERATURE = 0.2
 
 

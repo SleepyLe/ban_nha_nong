@@ -25,10 +25,13 @@ import os
 import re
 import sqlite3
 import unicodedata
+import logging
 from pathlib import Path
 
 from app.backend import db as db_module
 from app.backend import product_guard
+
+logger = logging.getLogger(__name__)
 
 KB_DB_PATH = Path("data/kb.db")
 
@@ -371,6 +374,130 @@ def _abstain_lite_segments() -> list[dict]:
         {"type": "text", "content": content},
         {"type": "abstain", "reason": reason, "handoff": True},
     ]
+
+
+def _web_fallback_response(
+    text: str,
+    region: str,
+    on_date: str,
+    crop: str | None,
+    pest: str | None,
+    reason: str,
+) -> dict | None:
+    """Call web grounding fail-closed; lỗi/thiếu citation trả None cho fallback cũ."""
+    from app.backend import web_grounding
+
+    if not web_grounding.enabled():
+        return None
+    try:
+        result = web_grounding.search_and_answer(
+            text,
+            region,
+            crop=crop,
+            pest=pest,
+            fallback_reason=reason,
+            on_date=on_date,
+        )
+    except Exception as exc:
+        logger.exception("Tavily Search fallback failed: %s", reason)
+        try:
+            import httpx
+
+            if isinstance(exc, httpx.ConnectError):
+                failure_text = (
+                    "Dạ, em đã thử tra cứu web nhưng hiện không thể kết nối tới Tavily Search. "
+                    "Bác vui lòng kiểm tra kết nối mạng hoặc cấu hình proxy của backend rồi thử lại."
+                )
+                failure_reason = "Không thể kết nối tới Tavily Search (lỗi mạng/proxy)."
+            elif isinstance(exc, httpx.TimeoutException):
+                failure_text = (
+                    "Dạ, Tavily Search phản hồi quá thời gian chờ nên em chưa thể tổng hợp "
+                    "câu trả lời có nguồn cho bác lúc này. Bác thử lại sau ít phút nhé."
+                )
+                failure_reason = "Tavily Search phản hồi quá thời gian chờ."
+            elif isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in {401, 403}:
+                failure_text = (
+                    "Dạ, Tavily Search từ chối xác thực API key. Bác vui lòng kiểm tra lại "
+                    "TAVILY_API_KEY trong cấu hình backend."
+                )
+                failure_reason = "Tavily Search từ chối API key."
+            elif (
+                isinstance(exc, httpx.HTTPStatusError)
+                and exc.response.status_code == 429
+            ) or "429" in str(exc):
+                failure_text = (
+                    "Dạ, Tavily Search đang giới hạn tần suất hoặc đã hết quota/hạn mức, "
+                    "nên em chưa thể tổng hợp câu trả lời có nguồn cho bác lúc này."
+                )
+                failure_reason = "Tavily Search đang giới hạn tần suất hoặc đã hết quota/hạn mức."
+            else:
+                failure_text = (
+                    "Dạ, em đã thử tra cứu web nhưng Tavily Search trả lỗi kỹ thuật, "
+                    "nên em chưa thể tổng hợp câu trả lời có nguồn cho bác lúc này."
+                )
+                failure_reason = "Tavily Search trả lỗi kỹ thuật."
+        except Exception:
+            failure_text = (
+                "Dạ, em đã thử tra cứu web nhưng Tavily Search trả lỗi kỹ thuật, "
+                "nên em chưa thể tổng hợp câu trả lời có nguồn cho bác lúc này."
+            )
+            failure_reason = "Tavily Search trả lỗi kỹ thuật."
+        return {
+            "risk_class": "B",
+            "answer_segments": [
+                {
+                    "type": "text",
+                    "content": failure_text,
+                },
+                {
+                    "type": "abstain",
+                    "reason": failure_reason,
+                    "handoff": True,
+                },
+            ],
+            "slots": {"crop": crop, "pest": pest, "region": region},
+            "products": [],
+        }
+    segments = web_grounding.answer_segments(result)
+    if not segments:
+        return None
+    return {
+        "risk_class": "B",
+        "answer_segments": segments,
+        "slots": {"crop": crop, "pest": pest, "region": region},
+        "products": [],
+    }
+
+
+def _registry_result_needs_web(result) -> tuple[bool, str]:
+    """Chỉ web-fallback khi tool chạy thành công nhưng thật sự không có dữ liệu.
+
+    ``not_registered`` là một kết luận âm có căn cứ từ registry, không phải thiếu
+    dữ liệu, nên tuyệt đối không cho web ghi đè kết luận đó.
+    """
+    from app.backend.schemas import (
+        ProductRegistrantResponse,
+        ProductRegistrationResponse,
+        ProductStatusResponse,
+        RegistrySearchResponse,
+    )
+
+    if isinstance(result, RegistrySearchResponse) and not result.products:
+        return True, "registry_has_no_registered_products"
+    if isinstance(result, ProductRegistrationResponse) and result.resolution == "not_found":
+        return True, result.reason_code
+    if isinstance(result, ProductStatusResponse) and result.resolution == "not_found":
+        return True, result.reason_code
+    if isinstance(result, ProductRegistrantResponse):
+        if result.resolution == "not_found" or (
+            result.resolution == "found" and not result.registrant
+        ):
+            return True, result.reason_code
+    return False, ""
+
+
+def _segments_abstained(segments: list[dict]) -> bool:
+    return any(segment.get("type") == "abstain" for segment in segments)
 
 
 def _out_of_kb_crop_segments(crop: str, region_name: str) -> list[dict]:
@@ -761,6 +888,47 @@ def _render_registrant_tool(result, region: str, crop: str | None, pest: str | N
     }
 
 
+def _render_product_uses_from_registry(
+    conn,
+    trade_name: str,
+    formulation: str | None,
+    on_date: str,
+    region: str,
+) -> dict | None:
+    """Trả công dụng đã đăng ký; chỉ trả khi định danh hiện hành là duy nhất và có uses."""
+    hits = db_module.lookup_exact_products(conn, trade_name, formulation, on_date)
+    if len(hits) != 1 or hits[0].status != "allowed":
+        return None
+    hit = hits[0]
+    uses = db_module.list_product_uses(conn, hit.product_id)
+    if not uses:
+        return None
+
+    grouped: dict[str, list[str]] = {}
+    for registered_crop, registered_pest in uses:
+        grouped.setdefault(registered_crop, []).append(registered_pest)
+    use_text = "; ".join(
+        f"{registered_crop}: {', '.join(registered_pests)}"
+        for registered_crop, registered_pests in grouped.items()
+    )
+    name = f"{hit.trade_name} {hit.formulation or ''}".strip()
+    return {
+        "risk_class": "A",
+        "answer_segments": [
+            {
+                "type": "text",
+                "content": (
+                    f"Dạ, theo danh mục hiện hành, {name} là thuốc trừ sâu chứa "
+                    f"{hit.active_ingredient}, được đăng ký phòng trừ: {use_text}."
+                ),
+            },
+            {"type": "citation", "source": hit.cite, "url": hit.source_url},
+        ],
+        "slots": {"crop": None, "pest": None, "region": region},
+        "products": [],
+    }
+
+
 def _render_registry_tool(result, plan, region: str, crop: str | None, pest: str | None) -> dict:
     from app.backend.schemas import (
         ProductRegistrantResponse,
@@ -960,14 +1128,55 @@ def answer(
             region=region,
             on_date=on_date,
         )
+        product_uses_question = registry_agent.is_product_uses_question(text)
+        if resolved_product and product_uses_question:
+            registry_uses_response = _render_product_uses_from_registry(
+                conn,
+                resolved_product,
+                resolved_formulation,
+                on_date,
+                region,
+            )
+            if registry_uses_response is not None:
+                return registry_uses_response
+
         decision = registry_agent.choose_tool(query)
         if decision is not None:
             try:
                 tool_result = registry_agent.execute_tool(decision, query, conn=conn)
+                needs_web, web_reason = _registry_result_needs_web(tool_result)
+                if needs_web:
+                    web_response = _web_fallback_response(
+                        text, region, on_date, crop, pest, web_reason
+                    )
+                    if web_response is not None:
+                        return web_response
                 answer_plan = registry_agent.synthesize_plan(tool_result)
                 return _render_registry_tool(tool_result, answer_plan, region, crop, pest)
             except Exception:
                 return _tool_failure_response(region, crop, pest, "registry_tool_execution_failed")
+
+        # Có sản phẩm cụ thể nhưng không có registry tool phù hợp, hoặc câu có
+        # intent hỏi công dụng thuốc nhưng tên bị gõ sai/chưa resolve (vd
+        # "9x actinone dùng để làm gì") thì không đẩy sang KB canh tác chung.
+        # Tavily Search có thể tìm theo chính chuỗi người dùng và trả nguồn.
+        if resolved_product or product_uses_question:
+            reason = (
+                "registry_product_has_no_registered_uses"
+                if resolved_product
+                else "unresolved_product_uses_question"
+            )
+            web_response = _web_fallback_response(
+                text, region, on_date, crop, pest, reason
+            )
+            if web_response is not None:
+                return web_response
+            return {
+                "risk_class": "B",
+                "answer_segments": _abstain_lite_segments(),
+                "slots": slots,
+                "products": [],
+            }
 
         multi_crop_note = None
         if crop and len(crop_seen) > 1:
@@ -977,11 +1186,27 @@ def answer(
         # có pest thì để path A ở trên xử lý, registry.db độc lập với phạm vi KB) ---
         if crop and pest is None and crop not in _kb_crops():
             segments = _out_of_kb_crop_segments(crop, region_name)
+            web_response = _web_fallback_response(
+                text, region, on_date, crop, pest, "cultivation_kb_has_no_crop_document"
+            )
+            if web_response is not None:
+                return web_response
             return {"risk_class": "B", "answer_segments": segments, "slots": slots, "products": []}
 
         if _rag_b_enabled():
             segments = _rag_b_segments(text, region, crop)
+            if _segments_abstained(segments):
+                web_response = _web_fallback_response(
+                    text, region, on_date, crop, pest, "internal_rag_not_grounded"
+                )
+                if web_response is not None:
+                    return web_response
         else:
+            web_response = _web_fallback_response(
+                text, region, on_date, crop, pest, "internal_rag_unavailable"
+            )
+            if web_response is not None:
+                return web_response
             segments = _mock_segments()
         return {"risk_class": "B", "answer_segments": segments, "slots": slots, "products": []}
     finally:

@@ -13,3 +13,4 @@ if str(project_root) not in sys.path:
 def _disable_live_registry_agent(monkeypatch):
     """Unit/integration tests must never depend on Gemini or network state."""
     monkeypatch.setenv("REGISTRY_AGENT_MODE", "off")
+    monkeypatch.setenv("WEB_SEARCH_MODE", "off")

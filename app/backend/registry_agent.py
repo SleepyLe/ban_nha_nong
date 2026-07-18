@@ -32,13 +32,17 @@ ToolName = Literal[
     "get_product_registrant",
 ]
 
-DEFAULT_MODEL = "gemini-flash-lite-latest"
+DEFAULT_MODEL = "gemini-3.1-flash-lite"
 
 _REGISTRANT_RE = re.compile(
     r"\b(?:cong ty|don vi|nha dang ky|ai dang ky|cua ai|cua cong ty nao)\b"
 )
 _LEGAL_RE = re.compile(
     r"\b(?:con duoc|duoc phep|bi cam|cam roi|bi loai|thu hoi|het hieu luc|trang thai)\b"
+)
+_PRODUCT_USES_RE = re.compile(
+    r"\b(?:dung de lam gi|tac dung|cong dung|dung cho viec gi|tri gi|tri benh gi|"
+    r"tri sau gi|phong tru gi|dac tri gi)\b"
 )
 
 
@@ -88,6 +92,11 @@ def _mode() -> str:
     return os.environ.get("REGISTRY_AGENT_MODE", "auto").strip().lower()
 
 
+def is_product_uses_question(text: str) -> bool:
+    """Nhận diện intent hỏi công dụng kể cả khi tên thuốc chưa resolve được."""
+    return _PRODUCT_USES_RE.search(_fold(text)) is not None
+
+
 def _get_client():
     from dotenv import load_dotenv
 
@@ -109,6 +118,10 @@ def _deterministic_tool(query: ResolvedQuery) -> ToolName | None:
             return "get_product_legal_status"
         if query.crop and query.pest:
             return "check_product_registration"
+        # Pipeline tra uses trong registry trực tiếp trước. Nếu không có uses, trả
+        # None để đi web fallback; tuyệt đối không đổi câu hỏi thành legal-status.
+        if is_product_uses_question(query.original_text):
+            return None
         return "get_product_legal_status"
     if query.crop and query.pest:
         return "list_registered_products"

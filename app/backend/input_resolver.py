@@ -26,7 +26,7 @@ from rapidfuzz.distance import Levenshtein
 from app.backend import product_guard
 
 REGISTRY_DB_PATH = Path("data/registry.db")
-DEFAULT_REVIEW_MODEL = "gemini-flash-lite-latest"
+DEFAULT_REVIEW_MODEL = "gemini-3.1-flash-lite"
 
 # Curated transcript aliases are intentionally explicit.  Fuzzy results are only
 # suggestions requiring confirmation; these aliases improve candidate recall but
@@ -62,6 +62,11 @@ _FORMULATION_LIKE_RE = re.compile(
 )
 _AGRO_REVIEW_CUE_RE = re.compile(
     r"\b(?:thuoc|phun|xit|tri|bi|sau|benh|dich hai|diet)\b",
+    re.IGNORECASE,
+)
+_NAMED_PRODUCT_CUE_RE = re.compile(
+    r"\bthuoc\s+(?!(?:nay|nao|gi|dung|tri|phun|xit|cho|bao ve|sinh hoc|"
+    r"hoa hoc|tru sau|tru benh|bvtv)\b)",
     re.IGNORECASE,
 )
 _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
@@ -160,10 +165,17 @@ def _catalogs() -> dict[str, Any]:
         conn.close()
 
     product_by_key: dict[str, tuple[str, str | None]] = {}
+    products_by_name: dict[str, list[tuple[str, str | None]]] = {}
     for trade_name, formulation in products:
         key = fold_text(f"{trade_name} {formulation or ''}")
         product_by_key[key] = (trade_name, formulation)
-        product_by_key.setdefault(fold_text(trade_name), (trade_name, None))
+        products_by_name.setdefault(fold_text(trade_name), []).append((trade_name, formulation))
+    for bare_key, variants in products_by_name.items():
+        formulations = {formulation for _, formulation in variants}
+        # Với tên chỉ có đúng một quy cách trong registry, giữ luôn formulation khi
+        # chuẩn hóa tên trần để câu xác nhận và web query không bị thiếu định danh.
+        bare_formulation = next(iter(formulations)) if len(formulations) == 1 else None
+        product_by_key[bare_key] = (variants[0][0], bare_formulation)
     alias_map = dict(CURATED_PRODUCT_ALIASES)
     for alias, canonical in db_aliases:
         matches = [p for p in products if fold_text(p[0]) == fold_text(canonical)]
@@ -183,8 +195,14 @@ def clear_cache() -> None:
     _catalogs.cache_clear()
 
 
-def _product_candidate(text: str) -> tuple[EntityCandidate | None, bool, bool]:
-    """Return candidate, product-like flag, and exact safety-guard flag."""
+def _product_candidates(text: str) -> tuple[list[EntityCandidate], bool, bool]:
+    """Return allow-listed product candidates for deterministic/LLM ranking.
+
+    Trước đây fuzzy product chỉ chạy khi có quy cách giống ``250SC``/``4.3EC``.
+    Vì vậy ``thuốc 9x actinone`` không tạo candidate nào và LLM không bao giờ có
+    cơ hội chuẩn hóa. Nay một cụm có dạng ``thuốc <tên riêng>`` cũng bật fuzzy,
+    nhưng chỉ khi best score đủ cao; mọi kết quả vẫn phải được user xác nhận.
+    """
     catalogs = _catalogs()
     folded = fold_text(text)
     collapsed = fold_text(text, collapse_repeats=True)
@@ -193,33 +211,65 @@ def _product_candidate(text: str) -> tuple[EntityCandidate | None, bool, bool]:
     ):
         alias_pattern = rf"(?<!\w){re.escape(alias)}(?!\w)"
         if alias and (re.search(alias_pattern, folded) or re.search(alias_pattern, collapsed)):
-            return EntityCandidate(
-                candidate_id=f"product:{fold_text(trade_name)}:{fold_text(formulation or '')}",
-                entity_type="product", canonical=trade_name, formulation=formulation,
-                score=100.0, match_type="curated_alias",
-            ), True, False
+            return [
+                EntityCandidate(
+                    candidate_id=f"product:{fold_text(trade_name)}:{fold_text(formulation or '')}",
+                    entity_type="product", canonical=trade_name, formulation=formulation,
+                    score=100.0, match_type="curated_alias",
+                )
+            ], True, False
 
     # Exact products and banned active ingredients must retain priority over
     # fuzzy crop/pest review (for example "bị cấm" must not become crop "cam").
     if product_guard.find_product_or_ai_mention(text) is not None:
-        return None, False, True
+        return [], False, True
 
-    product_like = bool(_FORMULATION_LIKE_RE.search(folded))
+    has_formulation = bool(_FORMULATION_LIKE_RE.search(folded))
+    has_named_product_cue = bool(_NAMED_PRODUCT_CUE_RE.search(folded))
+    product_like = has_formulation or has_named_product_cue
     if not product_like:
-        return None, False, False
+        return [], False, False
 
-    best = process.extractOne(folded, catalogs["product_keys"], scorer=fuzz.partial_ratio, score_cutoff=86)
-    if best is None:
-        best = process.extractOne(collapsed, catalogs["product_keys"], scorer=fuzz.partial_ratio, score_cutoff=88)
-    if best is None:
-        return None, True, False
-    key, score, _ = best
-    trade_name, formulation = catalogs["product_by_key"][key]
-    return EntityCandidate(
-        candidate_id=f"product:{fold_text(trade_name)}:{fold_text(formulation or '')}",
-        entity_type="product", canonical=trade_name, formulation=formulation,
-        score=float(score), match_type="fuzzy",
-    ), True, False
+    # Bare name không có formulation dễ va chạm hơn, nên best candidate phải >=88.
+    # Sau khi qua cổng này, đưa tối đa 5 ứng viên gần nhất vào allow-list để Gemini
+    # xếp hạng; model không được phép tạo tên ngoài danh mục.
+    score_cutoff = 82.0 if has_named_product_cue and not has_formulation else 86.0
+    best_by_key: dict[str, float] = {}
+    for query_text in (folded, collapsed):
+        for key, score, _ in process.extract(
+            query_text,
+            catalogs["product_keys"],
+            scorer=fuzz.partial_ratio,
+            score_cutoff=score_cutoff,
+            limit=8,
+        ):
+            best_by_key[key] = max(float(score), best_by_key.get(key, 0.0))
+    ranked = sorted(best_by_key.items(), key=lambda item: item[1], reverse=True)
+    minimum_best = 88.0 if has_named_product_cue and not has_formulation else 86.0
+    if not ranked or ranked[0][1] < minimum_best:
+        return [], True, False
+
+    candidates: list[EntityCandidate] = []
+    seen: set[tuple[str, str | None]] = set()
+    for key, score in ranked:
+        trade_name, formulation = catalogs["product_by_key"][key]
+        identity = (trade_name, formulation)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        candidates.append(
+            EntityCandidate(
+                candidate_id=f"product:{fold_text(trade_name)}:{fold_text(formulation or '')}",
+                entity_type="product",
+                canonical=trade_name,
+                formulation=formulation,
+                score=score,
+                match_type="fuzzy",
+            )
+        )
+        if len(candidates) == 5:
+            break
+    return candidates, True, False
 
 
 def _entity_candidates(text: str, entity_type: Literal["crop", "pest"], limit: int = 5) -> list[EntityCandidate]:
@@ -402,7 +452,7 @@ def review_input(text: str, *, client=None) -> InputReview | None:
     """Return a clarification decision, or None when normal pipeline may proceed."""
     if product_guard.has_double_dose_premise(text):
         return None
-    product, product_like, exact_guarded_mention = _product_candidate(text)
+    product_candidates, product_like, exact_guarded_mention = _product_candidates(text)
     if exact_guarded_mention:
         return None
     crop_candidates = _entity_candidates(text, "crop")
@@ -427,21 +477,41 @@ def review_input(text: str, *, client=None) -> InputReview | None:
     exact_crop, noisy_crops = _partition_entity_candidates(crop_candidates)
     exact_pest, noisy_pests = _partition_entity_candidates(pest_candidates)
 
+    # ``có thuốc: sầu riêng bị ốc bươu vàng`` không hề nêu tên sản phẩm: phần
+    # sau chữ "thuốc" bắt đầu bằng crop. Bare-product cue chỉ là tín hiệu hình
+    # thức nên phải nhường cho entity exact, nếu không prompt-injection/câu hỏi
+    # danh sách thuốc sẽ bị đổi thành unknown_product và mất guard risk A.
+    if product_like and not _FORMULATION_LIKE_RE.search(fold_text(text)):
+        folded = fold_text(text)
+        exact_entities = [
+            candidate
+            for candidate in crop_candidates + pest_candidates
+            if candidate.match_type == "exact"
+        ]
+        if any(
+            re.search(
+                rf"\bthuoc\s+{re.escape(fold_text(candidate.canonical))}\b",
+                folded,
+            )
+            for candidate in exact_entities
+        ):
+            product_candidates = []
+            product_like = False
+
     # Do not turn ordinary conversational phrases into fuzzy entities. For
     # example, "mưa cần" is one edit away from registry crop "lúa cạn" but a
     # general cultivation question has no treatment/entity-resolution intent.
     if (
-        product is None
+        not product_candidates
         and not product_like
         and not _AGRO_REVIEW_CUE_RE.search(fold_text(text))
     ):
         return None
 
     # No product suspicion and no spelling noise: preserve existing exact routing.
-    if product is None and not product_like and not noisy_crops and not noisy_pests:
+    if not product_candidates and not product_like and not noisy_crops and not noisy_pests:
         return None
 
-    product_candidates = [product] if product else []
     eligible_crops = [exact_crop] if exact_crop else noisy_crops
     eligible_pests = [exact_pest] if exact_pest else noisy_pests
     llm = _review_with_llm(
@@ -491,5 +561,12 @@ def canonical_question(payload: dict[str, Any]) -> str | None:
     if pest.get("canonical"):
         parts.append(f"bị {pest['canonical']}")
     if not pest.get("canonical"):
+        original = fold_text(payload.get("original_text") or "")
+        product_info_intent = re.search(
+            r"\b(?:dung de lam gi|tac dung|cong dung|tri gi|phong tru gi|dac tri gi)\b",
+            original,
+        )
+        if product.get("canonical") and product_info_intent:
+            return " ".join(parts) + " dùng để làm gì?"
         return None  # never turn an unclear symptom into a pesticide lookup
     return " ".join(parts) + " dùng thuốc gì?"
