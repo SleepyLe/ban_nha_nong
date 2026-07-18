@@ -14,6 +14,7 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Response, UploadFile
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.backend import asr, history, pipeline, registry_api, tts
@@ -139,6 +140,16 @@ def handoff(req: HandoffRequest) -> HandoffResponse:
     finally:
         conn.close()
     return HandoffResponse(ticket_id=ticket_id)
+
+
+@app.get("/")
+def landing():
+    return FileResponse(WEB_DIR / "landing.html")
+
+
+@app.get("/chat")
+def chat():
+    return FileResponse(WEB_DIR / "index.html")
 
 
 # Đăng ký API routes xong mới mount static — mount "/" chỉ bắt các path không khớp
