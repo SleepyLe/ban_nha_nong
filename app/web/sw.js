@@ -2,8 +2,15 @@
 
 /* Cache tĩnh tối thiểu cho app shell — không bao giờ cache /api/*. */
 
-const CACHE_NAME = "bnn-shell-v21";
-const SHELL_URLS = ["/chat", "/app.css", "/app.js", "/manifest.webmanifest", "/icon.svg"];
+const CACHE_NAME = "bnn-shell-v25";
+const SHELL_URLS = [
+  "/chat?app=v25",
+  "/app.css?v=25",
+  "/app.js?v=25",
+  "/manifest.webmanifest",
+  "/icon.svg",
+];
+const CHAT_SHELL_PATHS = new Set(["/chat", "/app.css", "/app.js"]);
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -29,12 +36,12 @@ self.addEventListener("fetch", (event) => {
 
   const url = new URL(request.url);
   if (url.pathname.startsWith("/api/")) return; // luôn qua mạng, không cache dữ liệu động
-  // Dashboard cán bộ luôn lấy bản mới nhất — tránh CSS/JS cũ dính cache khi đang chỉnh sửa
+  // Dashboard cán bộ luôn lấy bản mới nhất.
   if (url.pathname.startsWith("/officer")) return;
 
-  // Dashboard cán bộ thay đổi thường xuyên và không tự nạp app.js của PWA chính.
-  // Ưu tiên mạng để tránh trả index/JS/CSS cũ; cache chỉ dùng khi thực sự offline.
-  if (url.pathname.startsWith("/officer")) {
+  // HTML/CSS/JS của chat phải network-first. Cache-first từng làm code trước
+  // merge đè code mới: composer trôi khỏi viewport và thẻ liều bị ẩn.
+  if (request.mode === "navigate" || CHAT_SHELL_PATHS.has(url.pathname)) {
     event.respondWith(
       fetch(request)
         .then((response) => {

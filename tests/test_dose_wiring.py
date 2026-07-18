@@ -78,6 +78,10 @@ def test_dose_verified_hien_so_that_va_xep_len_dau(monkeypatch, tmp_path):
 
     # Khi đã có ít nhất một liều verified, không trộn thêm sản phẩm placeholder.
     assert not any(b["dose_text"] == pipeline._DOSE_TEXT for b in blocks)
+    assert not any(
+        segment["type"] == "handoff_warning"
+        for segment in result["answer_segments"]
+    )
 
 
 def test_lieu_nam_ngoai_top_5_van_duoc_chon(monkeypatch, tmp_path):
@@ -116,6 +120,19 @@ def test_khong_co_labels_db_van_placeholder_khong_loi(monkeypatch, tmp_path):
         assert b.get("source_url") is None
     # Thứ tự không đổi khi không có dose nào (không labels.db).
     assert [b["product"] for b in blocks] == _ALL_LABELS_ORIGINAL_ORDER
+    warnings = [
+        segment for segment in result["answer_segments"]
+        if segment["type"] == "handoff_warning"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["handoff"] is True
+    assert "liên hệ cán bộ khuyến nông" in warnings[0]["reason"]
+    assert "liều dùng" in warnings[0]["reason"]
+    assert "nội dung này" not in warnings[0]["reason"]
+    assert "Mã lý do" not in warnings[0]["reason"]
+    assert "labels_database_has_no_verified_dose" not in warnings[0]["reason"]
+    assert all(block["note"] == "" for block in blocks)
+    assert all("labels.db" not in block["dose_text"] for block in blocks)
 
 
 def test_dose_chua_verified_van_placeholder(monkeypatch, tmp_path):
@@ -133,6 +150,10 @@ def test_dose_chua_verified_van_placeholder(monkeypatch, tmp_path):
         assert b["note"] == pipeline._DOSE_NOTE
         assert b.get("source_url") is None
     assert [b["product"] for b in blocks] == _ALL_LABELS_ORIGINAL_ORDER
+    assert any(
+        segment["type"] == "handoff_warning" and segment["handoff"] is True
+        for segment in result["answer_segments"]
+    )
 
 
 def test_get_dose_khong_tra_lieu_cua_quy_cach_khac(tmp_path, monkeypatch):

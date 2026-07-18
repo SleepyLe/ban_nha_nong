@@ -33,8 +33,6 @@ body {
 
 body {
   margin: 0;
-  min-height: 100vh;
-  min-height: 100svh;
   overflow: hidden;
   background: var(--bg);
   color: var(--text);
@@ -95,7 +93,6 @@ svg {
   grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
   height: 100vh;
   height: 100dvh;
-  height: 100svh;
   min-height: 0;
   max-height: 100dvh;
   overflow: hidden;
@@ -472,7 +469,6 @@ svg {
 /* Conversation */
 
 .chat {
-  flex: 1 1 auto;
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
@@ -1154,7 +1150,6 @@ svg {
   z-index: 10;
   min-height: 0;
   overflow: visible;
-  flex-shrink: 0;
   padding: 0 20px calc(10px + env(safe-area-inset-bottom));
   background: white;
 }

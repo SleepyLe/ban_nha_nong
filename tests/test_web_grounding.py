@@ -306,6 +306,13 @@ def test_registry_rong_thi_di_web(monkeypatch):
     assert search.call_count == 1
     assert search.call_args.kwargs["fallback_reason"] == "registry_has_no_registered_products"
     assert web_grounding.WEB_SEARCH_WARNING in result["answer_segments"][0]["content"]
+    warnings = [
+        segment for segment in result["answer_segments"]
+        if segment["type"] == "handoff_warning"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["handoff"] is True
+    assert "liên hệ cán bộ khuyến nông" in warnings[0]["reason"]
 
 
 def test_ket_luan_not_registered_khong_bi_web_ghi_de(monkeypatch):

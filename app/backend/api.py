@@ -133,8 +133,8 @@ def ask(req: AskRequest) -> AskResponse:
             })
         if resolution.review is not None:
             review = resolution.review
-            if req.session_id and review.action == "confirm":
-                clarifications.save(req.session_id, review.pending_payload())
+            if review.action == "confirm":
+                clarifications.save(session_id, review.pending_payload())
             return finish({
                 "risk_class": "B",
                 "answer_segments": [{"type": "text", "content": review.message}],
@@ -255,7 +255,25 @@ def landing():
 
 @app.get("/chat")
 def chat():
-    return FileResponse(WEB_DIR / "index.html")
+    return FileResponse(
+        WEB_DIR / "index.html",
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+        },
+    )
+
+
+@app.get("/sw.js")
+def service_worker():
+    return FileResponse(
+        WEB_DIR / "sw.js",
+        media_type="application/javascript",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        },
+    )
 
 
 

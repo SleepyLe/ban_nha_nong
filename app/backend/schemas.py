@@ -58,8 +58,22 @@ class AbstainSegment(BaseModel):
     handoff: bool = True
 
 
+class HandoffWarningSegment(BaseModel):
+    """A partial-data warning that offers officer handoff without abstaining."""
+
+    type: Literal["handoff_warning"] = "handoff_warning"
+    reason: str
+    handoff: bool = True
+
+
 AnswerSegment = Annotated[
-    Union[TextSegment, DoseBlockSegment, CitationSegment, AbstainSegment],
+    Union[
+        TextSegment,
+        DoseBlockSegment,
+        CitationSegment,
+        AbstainSegment,
+        HandoffWarningSegment,
+    ],
     Field(discriminator="type"),
 ]
 

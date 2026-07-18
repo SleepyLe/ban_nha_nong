@@ -45,8 +45,8 @@ DEMO_QUESTIONS = [
     "Sầu riêng bị thán thư trị bằng gì?",
 ]
 
-_DOSE_NOTE = "Dùng theo liều trên nhãn"
-_DOSE_TEXT = "Dùng theo liều hướng dẫn trên nhãn sản phẩm (labels.db đang được cán bộ kỹ thuật curate)"
+_DOSE_NOTE = ""
+_DOSE_TEXT = "Dùng theo liều hướng dẫn trên nhãn sản phẩm"
 _DOSE_NOTE_VERIFIED = "Liều chép nguyên văn từ nhãn đăng ký"
 
 LABELS_DB_PATH = Path("data/labels.db")
@@ -534,6 +534,9 @@ def _web_fallback_response(
     segments = web_grounding.answer_segments(result)
     if not segments:
         return None
+    # Web search is only reached after an internal database/KB miss.  Keep the
+    # grounded web answer, but make that data gap explicit and offer handoff.
+    segments = _append_database_gap_handoff(segments, reason)
     return {
         "risk_class": "B",
         "answer_segments": segments,
@@ -573,6 +576,46 @@ def _segments_abstained(segments: list[dict]) -> bool:
     return any(segment.get("type") == "abstain" for segment in segments)
 
 
+def _database_gap_handoff(reason: str) -> dict:
+    """Create the user-facing handoff warning for an internal data gap.
+
+    A web answer or a registry placeholder may still be useful, but it must not
+    hide the fact that the requested fact was absent from the curated database.
+    """
+    missing_information = {
+        "labels_database_has_no_verified_dose": "liều dùng",
+        "registry_has_no_registered_products": "thông tin sản phẩm đăng ký",
+        "registry_product_has_no_registered_uses": "công dụng đã đăng ký của thuốc",
+        "unresolved_product_uses_question": "công dụng của thuốc",
+        "registry_product_ambiguous": "thông tin định danh chính xác của sản phẩm",
+        "registry_product_not_found": "thông tin sản phẩm",
+        "registrant_missing": "thông tin đơn vị đăng ký sản phẩm",
+        "cultivation_kb_has_no_crop_document": "quy trình canh tác cho cây trồng này",
+        "internal_rag_not_grounded": "thông tin tư vấn canh tác đã được xác minh",
+        "internal_rag_unavailable": "thông tin tư vấn canh tác",
+        "internal_knowledge_database_unavailable": "thông tin tư vấn canh tác",
+    }.get(reason, "thông tin cần tra cứu")
+    return {
+        "type": "handoff_warning",
+        "reason": (
+            f"Cơ sở dữ liệu của hệ thống chưa có đủ {missing_information}. "
+            "Bác nên liên hệ cán bộ khuyến nông để làm rõ trước khi áp dụng."
+        ),
+        "handoff": True,
+    }
+
+
+def _append_database_gap_handoff(segments: list[dict], reason: str) -> list[dict]:
+    """Append exactly one handoff warning without mutating the caller's list."""
+    result = list(segments)
+    if not any(
+        segment.get("type") in {"abstain", "handoff_warning"}
+        for segment in result
+    ):
+        result.append(_database_gap_handoff(reason))
+    return result
+
+
 def _out_of_kb_crop_segments(crop: str, region_name: str) -> list[dict]:
     """Minh bạch phạm vi khi câu có crop slot nhưng crop đó KHÔNG nằm trong danh sách
     cây có tài liệu KB (vd "táo") và không có pest slot đi kèm. Thay abstain-lite mù
@@ -600,7 +643,10 @@ def _mock_segments() -> list[dict]:
         "Phần tư vấn canh tác đang được kết nối nguồn chính thống, bác thử hỏi em theo mấy câu ví dụ "
         f"dưới đây để em tra đúng thuốc cho bác nhé:\n{goi_y}"
     )
-    return [{"type": "text", "content": content}]
+    return [
+        {"type": "text", "content": content},
+        _database_gap_handoff("internal_knowledge_database_unavailable"),
+    ]
 
 
 def _clarify_segments(ambiguous: tuple[str, str]) -> list[dict]:
@@ -749,6 +795,12 @@ def _path_a_segments(
     for cite in seen_cites:
         segments.append({"type": "citation", "source": cite, "url": _doc_url_for_cite(cite, vocab["doc_urls"])})
 
+    if not verified_hits:
+        segments = _append_database_gap_handoff(
+            segments,
+            "labels_database_has_no_verified_dose",
+        )
+
     return segments, products
 
 
@@ -841,13 +893,19 @@ def _render_registration_tool(result, region: str) -> dict:
             f"Dạ, có. {product_name} được đăng ký chính thức để phòng trừ {result.pest} trên "
             f"{result.crop} trong danh mục còn hiệu lực. Em chỉ trả đúng sản phẩm bác vừa hỏi:"
         )
+        segments = [
+            {"type": "text", "content": content},
+            _specific_dose_block(result),
+            _tool_citation(result.product),
+        ]
+        if result.dose is None:
+            segments = _append_database_gap_handoff(
+                segments,
+                "labels_database_has_no_verified_dose",
+            )
         return {
             "risk_class": "A",
-            "answer_segments": [
-                {"type": "text", "content": content},
-                _specific_dose_block(result),
-                _tool_citation(result.product),
-            ],
+            "answer_segments": segments,
             "slots": slots,
             "products": [_tool_product_payload(result.product)],
         }
@@ -919,7 +977,14 @@ def _render_registration_tool(result, region: str) -> dict:
         )
     return {
         "risk_class": "B",
-        "answer_segments": [{"type": "text", "content": message}],
+        "answer_segments": [
+            {"type": "text", "content": message},
+            _database_gap_handoff(
+                "registry_product_ambiguous"
+                if result.resolution == "ambiguous"
+                else "registry_product_not_found"
+            ),
+        ],
         "slots": slots,
         "products": [],
     }

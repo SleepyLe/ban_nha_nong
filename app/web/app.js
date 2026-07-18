@@ -645,7 +645,9 @@ function renderAssistantMessage(message, conversation) {
   const answerRegion = message.answer.slots?.region || message.region || conversation.region;
   if (doseSegments.length) row.appendChild(renderDoseList(doseSegments, answerRegion));
   if (citationSegments.length) row.appendChild(renderCitations(citationSegments));
-  segments.filter((segment) => segment.type === "abstain").forEach((segment) => {
+  segments.filter((segment) => (
+    segment.type === "abstain" || segment.type === "handoff_warning"
+  )).forEach((segment) => {
     row.appendChild(renderHandoff(segment, message.answer, message.text, conversation, message));
   });
   const speechText = answerSpeechText(message.answer);
@@ -1312,7 +1314,7 @@ async function askBackend(conversation, message) {
     message.status = "error";
   } finally {
     conversation.updatedAt = new Date().toISOString();
-    saveConversations(conversation);
+    await saveConversations(conversation);
     state.isBusy = false;
     setStatus("");
     updateSendState();
@@ -1983,5 +1985,5 @@ function renderInboxDetail(conv, msg) {
 }
 
 function registerServiceWorker() {
-  if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js?v=25").catch(() => {});
 }

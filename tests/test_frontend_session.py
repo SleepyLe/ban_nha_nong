@@ -15,3 +15,4 @@ def test_frontend_gui_va_nhan_lai_session_id():
     assert "body.session_id" in APP_JS
     assert "body.session_turn_limit" in APP_JS
     assert "conversation.messages.splice" in APP_JS
+    assert "await saveConversations(conversation)" in APP_JS

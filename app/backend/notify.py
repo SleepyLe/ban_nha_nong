@@ -1,4 +1,4 @@
-"""Thông báo ticket handoff đã được cán bộ trả lời (SMTP email + Zalo OA).
+"""Thông báo ticket handoff đã được cán bộ trả lời (email + SMS + Zalo OA).
 
 Nguyên tắc: KHÔNG bao giờ raise ra ngoài endpoint — lỗi chỉ log.
 Hàm `notify_ticket_answered` luôn trả về chuỗi notified_via.
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 def notify_ticket_answered(ticket: dict) -> str:
     """Gửi thông báo khi ticket được cán bộ trả lời.
 
-    Trả về: "email", "zalo", "email,zalo", hoặc "none".
+    Trả về danh sách kênh đã gửi, ví dụ "email,sms", hoặc "none".
     Không bao giờ raise — lỗi chỉ log.
     """
     channels: list[str] = []
@@ -30,6 +30,17 @@ def notify_ticket_answered(ticket: dict) -> str:
             logger.info("Đã gửi email thông báo ticket %s", ticket.get("id"))
         except Exception:
             logger.exception("Gửi email thất bại cho ticket %s", ticket.get("id"))
+
+    sms_token = os.getenv("SPEEDSMS_ACCESS_TOKEN", "").strip()
+    if sms_token and ticket.get("contact_phone"):
+        try:
+            _send_sms(ticket, sms_token)
+            channels.append("sms")
+            logger.info("Đã gửi SMS thông báo ticket %s", ticket.get("id"))
+        except Exception:
+            logger.exception("Gửi SMS thất bại cho ticket %s", ticket.get("id"))
+    elif not sms_token:
+        logger.debug("sms skipped — SPEEDSMS_ACCESS_TOKEN chưa đặt")
 
     zalo_token = os.getenv("ZALO_OA_ACCESS_TOKEN", "").strip()
     if zalo_token and ticket.get("contact_phone"):
@@ -85,6 +96,57 @@ def _send_email(ticket: dict) -> None:
         if smtp_user and smtp_pass:
             server.login(smtp_user, smtp_pass)
         server.send_message(msg)
+
+
+def _normalize_sms_phone(value: str) -> str:
+    """Normalize a Vietnamese/local phone number for the SpeedSMS API."""
+    raw = value.strip()
+    if raw.startswith("+"):
+        raw = raw[1:]
+    digits = "".join(character for character in raw if character.isdigit())
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("0"):
+        digits = "84" + digits[1:]
+    if not 9 <= len(digits) <= 15:
+        raise ValueError("Số điện thoại nhận SMS không hợp lệ.")
+    return digits
+
+
+def _sms_body_text(ticket: dict) -> str:
+    """Keep the notification ASCII-only and short enough for one normal SMS."""
+    ticket_id = ticket.get("id", "")
+    return (
+        f"Ban Nha Nong: Can bo khuyen nong da tra loi cau hoi #{ticket_id}. "
+        "Mo ung dung de xem chi tiet."
+    )
+
+
+def _send_sms(ticket: dict, token: str) -> None:
+    """Send a notification through SpeedSMS and validate its API response."""
+    import httpx
+
+    phone = _normalize_sms_phone(str(ticket.get("contact_phone", "")))
+    sms_type = int(os.getenv("SPEEDSMS_SMS_TYPE", "4"))
+    sender = os.getenv("SPEEDSMS_SENDER", "Notify").strip() or "Notify"
+    response = httpx.post(
+        "https://api.speedsms.vn/index.php/sms/send",
+        auth=(token, "x"),
+        headers={"Content-Type": "application/json"},
+        json={
+            "to": [phone],
+            "content": _sms_body_text(ticket),
+            "sms_type": sms_type,
+            "sender": sender,
+        },
+        timeout=10,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("status") != "success" or str(payload.get("code")) != "00":
+        raise RuntimeError(
+            f"SpeedSMS rejected request: {payload.get('code', 'unknown')}"
+        )
 
 
 def _send_zalo(ticket: dict, token: str) -> None:
