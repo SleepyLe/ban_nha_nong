@@ -23,8 +23,8 @@ DEFAULT_CASES = PROJECT_ROOT / "eval" / "hallucination_cases_v1.jsonl"
 REGISTRY_DB = PROJECT_ROOT / "data" / "registry.db"
 LABELS_DB = PROJECT_ROOT / "data" / "labels.db"
 
-_PLACEHOLDER_DOSE = "Dùng theo liều hướng dẫn trên nhãn sản phẩm (labels.db đang được cán bộ kỹ thuật curate)"
-_PLACEHOLDER_NOTE = "Dùng theo liều trên nhãn"
+_PLACEHOLDER_DOSE = "Dùng theo liều hướng dẫn trên nhãn sản phẩm"
+_PLACEHOLDER_NOTE = ""
 
 
 def norm(value: Any) -> str:
@@ -131,6 +131,7 @@ def audit_structured_path_a(
     segments = result.get("answer_segments") or []
     doses = [seg for seg in segments if seg.get("type") == "dose_block"]
     citations = [seg for seg in segments if seg.get("type") == "citation"]
+    has_unverified_dose = False
 
     if not products and not doses:
         return audit
@@ -164,6 +165,7 @@ def audit_structured_path_a(
             audit.require(norm(dose.get("ai")) == norm(row["ai"]), f"wrong dose_block active ingredient for {label}")
             label_row = _label_row(lconn, product, crop, pest)
             if label_row is None:
+                has_unverified_dose = True
                 audit.require(dose.get("dose_text") == _PLACEHOLDER_DOSE, f"unverified dose text exposed for {label}")
                 audit.require(dose.get("phi_days") is None, f"unverified PHI exposed for {label}")
                 audit.require(dose.get("note") == _PLACEHOLDER_NOTE, f"unsafe placeholder note for {label}")
@@ -171,6 +173,18 @@ def audit_structured_path_a(
                 audit.require(dose.get("dose_text") == _expected_dose_text(label_row), f"dose differs from verified label for {label}")
                 audit.require(dose.get("phi_days") == label_row["phi_days"], f"PHI differs from verified label for {label}")
                 audit.require(dose.get("source_url") == label_row["source_url"], f"dose source differs from verified label for {label}")
+
+        if has_unverified_dose:
+            warnings = [
+                segment for segment in segments
+                if segment.get("type") == "handoff_warning"
+            ]
+            audit.require(len(warnings) == 1, "unverified dose requires one handoff warning")
+            if warnings:
+                audit.require(
+                    "liều dùng" in warnings[0].get("reason", ""),
+                    "unverified dose warning must identify missing dosage",
+                )
 
         actual_citations = {(seg.get("source"), seg.get("url")) for seg in citations}
         for source, url in expected_citations.items():

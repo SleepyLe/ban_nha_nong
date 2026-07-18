@@ -8,7 +8,7 @@
   <title>Bạn Nhà Nông</title>
   <link rel="manifest" href="manifest.webmanifest" />
   <link rel="icon" href="icon.svg" type="image/svg+xml" />
-  <link rel="stylesheet" href="app.css" />
+  <link rel="stylesheet" href="app.css?v=25" />
 </head>
 <body>
   <svg class="icon-sprite" aria-hidden="true">
@@ -21,6 +21,7 @@
     <symbol id="icon-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
     <symbol id="icon-send" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></symbol>
     <symbol id="icon-mic" viewBox="0 0 24 24"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v1a7 7 0 0 0 14 0v-1M12 18v4M8 22h8"/></symbol>
+    <symbol id="icon-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9" r="1.5"/><path d="m4 17 4.5-4.5 3.2 3.2 2.3-2.3 6 5.6"/></symbol>
     <symbol id="icon-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
     <symbol id="icon-external" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4 10 14"/><path d="M18 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h6"/></symbol>
     <symbol id="icon-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1" fill="currentColor" stroke="none"/></symbol>
@@ -128,10 +129,15 @@
 
       <footer class="composer-wrap" id="composerWrap">
         <p class="status-line" id="statusLine" role="status" aria-live="polite"></p>
+        <div class="image-preview" id="imagePreview" aria-label="Ảnh chuẩn bị gửi" hidden></div>
         <form class="composer" id="composer">
           <label class="sr-only" for="textInput">Nhập câu hỏi</label>
           <textarea id="textInput" rows="1" maxlength="2000" placeholder="Hỏi về cây trồng, sâu bệnh, thuốc hoặc mùa vụ..." autocomplete="off"></textarea>
           <div class="composer-actions">
+            <input id="imageInput" type="file" accept="image/jpeg,image/png,image/webp" multiple hidden />
+            <button type="button" id="imageBtn" class="composer-icon-btn" aria-label="Thêm ảnh" title="Thêm ảnh nhãn thuốc hoặc cây trồng">
+              <svg><use href="#icon-image"></use></svg>
+            </button>
             <button type="button" id="micBtn" class="composer-icon-btn" aria-label="Bắt đầu ghi âm" aria-pressed="false" title="Nhấn để nói">
               <svg class="mic-default"><use href="#icon-mic"></use></svg>
               <svg class="mic-recording"><use href="#icon-stop"></use></svg>
@@ -146,6 +152,6 @@
     </section>
   </div>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=25"></script>
 </body>
 </html>

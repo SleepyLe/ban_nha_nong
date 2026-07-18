@@ -1,6 +1,7 @@
 pdfplumber==0.11.*
 httpx==0.28.*
 beautifulsoup4==4.12.*
+Pillow==12.*
 rapidfuzz==3.*
 pyvi==0.1.*
 pytest==8.*
@@ -10,6 +11,8 @@ fastapi==0.139.*
 uvicorn[standard]==0.51.*
 python-multipart==0.0.*
 python-dotenv==1.2.*
+# IANA timezone database for ZoneInfo on Windows (handoff/officer dashboard).
+tzdata>=2025.2
 
 # ASR chính: Google Cloud Speech-to-Text v2 (Chirp 3) — xem app/backend/asr.py
 google-cloud-speech==2.40.*

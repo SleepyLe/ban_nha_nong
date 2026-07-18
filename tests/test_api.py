@@ -14,6 +14,17 @@ from app.backend.api import app
 client = TestClient(app)
 
 
+def test_chat_va_service_worker_khong_bi_http_cache_cu_de_len() -> None:
+    chat_response = client.get("/chat?app=v25")
+    assert chat_response.status_code == 200
+    assert "no-store" in chat_response.headers.get("cache-control", "")
+
+    sw_response = client.get("/sw.js?v=25")
+    assert sw_response.status_code == 200
+    assert "javascript" in sw_response.headers.get("content-type", "")
+    assert "no-store" in sw_response.headers.get("cache-control", "")
+
+
 @pytest.fixture(autouse=True)
 def _clean_handoff_db(tmp_path, monkeypatch):
     """Mỗi test dùng HANDOFF_DB riêng trong tmp_path — không đụng data/handoff.db thật."""
@@ -390,4 +401,12 @@ def test_ask_san_pham_dung_dung_cay_khong_bi_chan_van_di_path_a_binh_thuong():
     assert body["risk_class"] == "A"
     assert types.count("dose_block") >= 1
     assert types.count("citation") >= 1
-    assert "abstain" not in types
+    # Sản phẩm/cặp cây-dịch hại hợp lệ vẫn đi đúng path A. Tuy nhiên labels.db
+    # chưa có liều đã xác minh nên quy tắc data-gap mới phải hiện handoff.
+    warnings = [
+        segment for segment in segments
+        if segment["type"] == "handoff_warning"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["handoff"] is True
+    assert "liên hệ cán bộ khuyến nông" in warnings[0]["reason"]

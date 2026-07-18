@@ -13,3 +13,14 @@ if str(project_root) not in sys.path:
 def _disable_live_registry_agent(monkeypatch):
     """Unit/integration tests must never depend on Gemini or network state."""
     monkeypatch.setenv("REGISTRY_AGENT_MODE", "off")
+    monkeypatch.setenv("WEB_SEARCH_MODE", "off")
+    monkeypatch.setenv("IMAGE_REVIEW_MODE", "off")
+    monkeypatch.setenv("CONVERSATION_CONTEXT_MODE", "off")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_conversation_memory(tmp_path, monkeypatch):
+    """API tests must never add session rows to the user's real history.db."""
+    from app.backend import history
+
+    monkeypatch.setattr(history, "HISTORY_DB", tmp_path / "history.db")

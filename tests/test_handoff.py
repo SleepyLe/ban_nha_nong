@@ -25,6 +25,8 @@ def handoff_db(tmp_path, monkeypatch):
     db_path = tmp_path / "test_handoff.db"
     monkeypatch.setattr(handoff_module, "HANDOFF_DB", db_path)
     monkeypatch.setattr(handoff_module, "_classify_backoff_until", 0.0)
+    # Unit tests must never send a real SMS even when the developer's .env is configured.
+    monkeypatch.delenv("SPEEDSMS_ACCESS_TOKEN", raising=False)
     return db_path
 
 

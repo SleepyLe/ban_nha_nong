@@ -31,6 +31,8 @@ const state = {
   activeId: null,
   draftRegion: loadRegion(),
   isBusy: false,
+  isUploading: false,
+  pendingImages: [],
   editingMessageId: null,
   view: "chat",
   inboxDetailMsg: null,
@@ -58,6 +60,7 @@ function init() {
     "sidebar", "sidebarOpen", "sidebarClose", "sidebarScrim", "brandHome",
     "conversationTitle", "conversationTitleBtn", "titleEdit", "titleInput",
     "regionMenu", "regionName", "composer", "textInput", "sendTextBtn", "micBtn",
+    "imageBtn", "imageInput", "imagePreview",
     "notifBtn", "notifBadge", "composerWrap", "mainPanel",
     "inboxSidebarBtn", "inboxSidebarBadge",
   ].forEach((id) => { els[id] = document.getElementById(id); });
@@ -79,6 +82,8 @@ function init() {
     if (event.key === "Escape") cancelTitleEdit();
   });
   els.composer.addEventListener("submit", submitTypedText);
+  els.imageBtn.addEventListener("click", () => els.imageInput.click());
+  els.imageInput.addEventListener("change", handleImageSelection);
   els.textInput.addEventListener("input", () => {
     autoSizeTextarea(els.textInput);
     updateSendState();
@@ -123,6 +128,10 @@ function makeId(prefix) {
 
 function makeSessionId() { return makeId("session"); }
 
+function validSessionId(value) {
+  return typeof value === "string" && value.length >= 8 && value.length <= 128;
+}
+
 function loadRegion() {
   const saved = localStorage.getItem(REGION_KEY);
   return REGION_META[saved] ? saved : "an_giang";
@@ -133,6 +142,7 @@ function repairLoadingMessages(conversations) {
     .filter((item) => item && item.id && Array.isArray(item.messages))
     .map((conversation) => ({
       ...conversation,
+      sessionId: validSessionId(conversation.sessionId) ? conversation.sessionId : makeSessionId(),
       messages: conversation.messages.map((message) => message.status === "loading" ? {
         ...message,
         status: "error",
@@ -149,7 +159,15 @@ async function loadConversationsFromServer() {
     let conversations = await response.json();
     if (!Array.isArray(conversations)) conversations = [];
     if (conversations.length === 0) conversations = await migrateLocalStorageOnce();
+    const missingSessionIds = new Set(
+      conversations.filter((item) => !validSessionId(item?.sessionId)).map((item) => item.id)
+    );
     state.conversations = repairLoadingMessages(conversations);
+    await Promise.all(
+      state.conversations
+        .filter((item) => missingSessionIds.has(item.id))
+        .map((item) => saveConversations(item))
+    );
     renderAll();
     pollHandoffTickets();
   } catch (_error) {
@@ -179,8 +197,8 @@ async function migrateLocalStorageOnce() {
 
 function saveConversations(conversation) {
   const target = conversation || getActiveConversation();
-  if (!target) return;
-  fetch(`/api/conversations/${encodeURIComponent(target.id)}`, {
+  if (!target) return Promise.resolve();
+  return fetch(`/api/conversations/${encodeURIComponent(target.id)}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(target),
@@ -219,6 +237,7 @@ function startNewConversation() {
   if (active) state.draftRegion = active.region;
   state.activeId = null;
   state.editingMessageId = null;
+  clearPendingImages();
   state.view = "chat";
   state.inboxDetailMsg = null;
   state.inboxSearch = "";
@@ -231,6 +250,7 @@ function startNewConversation() {
 
 function openConversation(id) {
   if (!state.conversations.some((conversation) => conversation.id === id)) return;
+  clearPendingImages();
   state.activeId = id;
   state.editingMessageId = null;
   state.view = "chat";
@@ -479,6 +499,18 @@ function renderUserMessage(message) {
   const bubble = document.createElement("p");
   bubble.className = "user-bubble";
   bubble.textContent = message.text;
+  if (Array.isArray(message.attachments) && message.attachments.length) {
+    const gallery = document.createElement("div");
+    gallery.className = "user-image-gallery";
+    message.attachments.forEach((attachment) => {
+      const image = document.createElement("img");
+      image.src = attachment.url || `/api/attachments/images/${encodeURIComponent(attachment.attachment_id)}`;
+      image.alt = attachment.original_name || "Ảnh người dùng gửi";
+      image.loading = "lazy";
+      gallery.appendChild(image);
+    });
+    row.appendChild(gallery);
+  }
   const tools = document.createElement("div");
   tools.className = "message-tools";
   const edit = messageTool("edit", "Sửa", () => {
@@ -613,7 +645,9 @@ function renderAssistantMessage(message, conversation) {
   const answerRegion = message.answer.slots?.region || message.region || conversation.region;
   if (doseSegments.length) row.appendChild(renderDoseList(doseSegments, answerRegion));
   if (citationSegments.length) row.appendChild(renderCitations(citationSegments));
-  segments.filter((segment) => segment.type === "abstain").forEach((segment) => {
+  segments.filter((segment) => (
+    segment.type === "abstain" || segment.type === "handoff_warning"
+  )).forEach((segment) => {
     row.appendChild(renderHandoff(segment, message.answer, message.text, conversation, message));
   });
   const speechText = answerSpeechText(message.answer);
@@ -638,8 +672,9 @@ function answerSpeechText(answer) {
     } else if (segment.type === "dose_block") {
       if (segment.product) parts.push(`Sản phẩm ${segment.product}.`);
       if (segment.ai) parts.push(`Hoạt chất ${segment.ai}.`);
-      const guidance = segment.note || segment.dose_text;
-      if (guidance) parts.push(`${guidance}.`);
+      if (segment.dose_text) parts.push(`Liều dùng ${segment.dose_text}.`);
+      if (Number.isInteger(segment.phi_days)) parts.push(`Thời gian cách ly ${segment.phi_days} ngày.`);
+      if (segment.note && segment.note !== segment.dose_text) parts.push(`${segment.note}.`);
     } else if (segment.type === "abstain" && segment.reason) {
       parts.push(segment.reason);
     }
@@ -900,10 +935,34 @@ function renderDoseList(segments, region) {
     const ai = document.createElement("p");
     ai.className = "dose-ai";
     ai.textContent = `Hoạt chất: ${segment.ai}`;
-    const note = document.createElement("span");
-    note.className = "dose-note";
-    note.textContent = segment.note || segment.dose_text;
-    item.append(product, ai, note);
+    const guidance = document.createElement("p");
+    guidance.className = "dose-guidance";
+    guidance.textContent = `Liều dùng: ${segment.dose_text}`;
+    const meta = document.createElement("div");
+    meta.className = "dose-meta";
+    if (Number.isInteger(segment.phi_days)) {
+      const phi = document.createElement("span");
+      phi.className = "dose-phi";
+      phi.textContent = `Thời gian cách ly: ${segment.phi_days} ngày`;
+      meta.appendChild(phi);
+    }
+    if (segment.note && segment.note !== segment.dose_text) {
+      const note = document.createElement("span");
+      note.className = "dose-note";
+      note.textContent = segment.note;
+      meta.appendChild(note);
+    }
+    if (segment.source_url) {
+      const source = document.createElement("a");
+      source.className = "dose-source";
+      source.href = segment.source_url;
+      source.target = "_blank";
+      source.rel = "noopener noreferrer";
+      source.textContent = "Nguồn liều";
+      meta.appendChild(source);
+    }
+    item.append(product, ai, guidance);
+    if (meta.children.length) item.appendChild(meta);
     list.appendChild(item);
   });
   return list;
@@ -1145,14 +1204,17 @@ function showHandoffFormModal(sourceText, answer, conversation, message, onSucce
 function submitTypedText(event) {
   if (event) event.preventDefault();
   const text = els.textInput.value.trim();
-  if (!text || state.isBusy) return;
+  const attachments = [...state.pendingImages];
+  if ((!text && !attachments.length) || state.isBusy || state.isUploading) return;
   els.textInput.value = "";
+  state.pendingImages = [];
+  renderPendingImages();
   autoSizeTextarea(els.textInput);
   updateSendState();
-  submitQuestion(text);
+  submitQuestion(text || "Nhờ em xem giúp ảnh này.", attachments);
 }
 
-function submitQuestion(text) {
+function submitQuestion(text, attachments = []) {
   const cleanText = String(text || "").trim();
   if (!cleanText || state.isBusy) return;
   const conversation = ensureConversation();
@@ -1160,6 +1222,7 @@ function submitQuestion(text) {
   const message = {
     id: makeId("message"),
     text: cleanText,
+    attachments: Array.isArray(attachments) ? attachments : [],
     revisions: [],
     answer: null,
     error: null,
@@ -1220,6 +1283,7 @@ function retryQuestion(messageId) {
 }
 
 async function askBackend(conversation, message) {
+  if (!validSessionId(conversation.sessionId)) conversation.sessionId = makeSessionId();
   state.isBusy = true;
   updateSendState();
   setStatus("Đang tra danh mục và nguồn địa phương...");
@@ -1227,19 +1291,30 @@ async function askBackend(conversation, message) {
     const response = await fetch("/api/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: message.text, region: message.region || conversation.region, session_id: conversation.sessionId }),
+      body: JSON.stringify({
+        text: message.text,
+        region: message.region || conversation.region,
+        session_id: conversation.sessionId,
+        attachment_ids: (message.attachments || []).map((attachment) => attachment.attachment_id),
+      }),
     });
-    if (!response.ok) throw new Error("request failed");
-    message.answer = await response.json();
+    const body = await safeJson(response);
+    if (!response.ok) throw new Error(body.detail || "Máy chủ chưa xử lý được câu hỏi.");
+    if (validSessionId(body.session_id)) conversation.sessionId = body.session_id;
+    message.answer = body;
+    const sessionTurnLimit = Number(body.session_turn_limit);
+    if (Number.isInteger(sessionTurnLimit) && sessionTurnLimit > 0 && conversation.messages.length > sessionTurnLimit) {
+      conversation.messages.splice(0, conversation.messages.length - sessionTurnLimit);
+    }
     message.error = null;
     message.status = "done";
-  } catch (_error) {
+  } catch (error) {
     message.answer = null;
-    message.error = "Không kết nối được máy chủ. Bác thử gửi lại câu hỏi sau ít phút.";
+    message.error = error.message || "Không kết nối được máy chủ. Bác thử gửi lại câu hỏi sau ít phút.";
     message.status = "error";
   } finally {
     conversation.updatedAt = new Date().toISOString();
-    saveConversations(conversation);
+    await saveConversations(conversation);
     state.isBusy = false;
     setStatus("");
     updateSendState();
@@ -1445,10 +1520,77 @@ function autoSizeTextarea(textarea) {
   textarea.style.height = `${Math.min(textarea.scrollHeight, 160)}px`;
 }
 
+async function handleImageSelection() {
+  const remaining = Math.max(0, 3 - state.pendingImages.length);
+  const files = Array.from(els.imageInput.files || []).slice(0, remaining);
+  els.imageInput.value = "";
+  if (!files.length) {
+    if (!remaining) setStatus("Mỗi câu hỏi chỉ được gửi tối đa 3 ảnh.");
+    return;
+  }
+  const invalid = files.find((file) => !["image/jpeg", "image/png", "image/webp"].includes(file.type) || file.size > 8 * 1024 * 1024);
+  if (invalid) {
+    setStatus("Chỉ hỗ trợ JPEG, PNG, WebP và tối đa 8 MB mỗi ảnh.");
+    return;
+  }
+
+  state.isUploading = true;
+  updateSendState();
+  setStatus("Đang tải và kiểm tra ảnh...");
+  try {
+    const form = new FormData();
+    files.forEach((file) => form.append("images", file, file.name));
+    const response = await fetch("/api/attachments/images", { method: "POST", body: form });
+    const body = await safeJson(response);
+    if (!response.ok) throw new Error(body.detail || "Không tải được ảnh.");
+    state.pendingImages.push(...(body.attachments || []));
+    renderPendingImages();
+    setStatus("");
+  } catch (error) {
+    setStatus(error.message || "Không tải được ảnh. Bác thử lại nhé.");
+  } finally {
+    state.isUploading = false;
+    updateSendState();
+  }
+}
+
+function renderPendingImages() {
+  els.imagePreview.replaceChildren();
+  els.imagePreview.hidden = state.pendingImages.length === 0;
+  state.pendingImages.forEach((attachment) => {
+    const item = document.createElement("div");
+    item.className = "image-preview-item";
+    const image = document.createElement("img");
+    image.src = attachment.url;
+    image.alt = attachment.original_name || "Ảnh chuẩn bị gửi";
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "image-preview-remove";
+    remove.setAttribute("aria-label", `Bỏ ảnh ${attachment.original_name || "đã chọn"}`);
+    remove.appendChild(icon("close"));
+    remove.addEventListener("click", () => {
+      state.pendingImages = state.pendingImages.filter((item) => item.attachment_id !== attachment.attachment_id);
+      renderPendingImages();
+      updateSendState();
+    });
+    item.append(image, remove);
+    els.imagePreview.appendChild(item);
+  });
+}
+
+function clearPendingImages() {
+  state.pendingImages = [];
+  if (els.imageInput) els.imageInput.value = "";
+  if (els.imagePreview) renderPendingImages();
+  updateSendState();
+}
+
 function updateSendState() {
-  els.sendTextBtn.disabled = state.isBusy || !els.textInput.value.trim();
-  els.textInput.disabled = state.isBusy;
-  els.micBtn.disabled = state.isBusy;
+  const locked = state.isBusy || state.isUploading;
+  els.sendTextBtn.disabled = locked || (!els.textInput.value.trim() && !state.pendingImages.length);
+  els.textInput.disabled = locked;
+  els.micBtn.disabled = locked;
+  if (els.imageBtn) els.imageBtn.disabled = locked || state.pendingImages.length >= 3;
 }
 
 function setStatus(message) { els.statusLine.textContent = message || ""; }
@@ -1843,5 +1985,5 @@ function renderInboxDetail(conv, msg) {
 }
 
 function registerServiceWorker() {
-  if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js?v=25").catch(() => {});
 }

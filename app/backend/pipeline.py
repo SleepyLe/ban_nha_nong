@@ -25,10 +25,13 @@ import os
 import re
 import sqlite3
 import unicodedata
+import logging
 from pathlib import Path
 
 from app.backend import db as db_module
 from app.backend import product_guard
+
+logger = logging.getLogger(__name__)
 
 KB_DB_PATH = Path("data/kb.db")
 
@@ -42,8 +45,8 @@ DEMO_QUESTIONS = [
     "Sầu riêng bị thán thư trị bằng gì?",
 ]
 
-_DOSE_NOTE = "Dùng theo liều trên nhãn"
-_DOSE_TEXT = "Dùng theo liều hướng dẫn trên nhãn sản phẩm (labels.db đang được cán bộ kỹ thuật curate)"
+_DOSE_NOTE = ""
+_DOSE_TEXT = "Dùng theo liều hướng dẫn trên nhãn sản phẩm"
 _DOSE_NOTE_VERIFIED = "Liều chép nguyên văn từ nhãn đăng ký"
 
 LABELS_DB_PATH = Path("data/labels.db")
@@ -266,6 +269,79 @@ def _crop_clarify_segments() -> list[dict]:
 # TRƯỚC clarify/product-guard/path A/path B, chỉ khi câu không có slot nào cả.
 _SMALLTALK_MAX_WORDS = 10
 
+_FOLLOW_UP_RE = re.compile(
+    r"\b(?:này|đó|vậy|thế|nó|còn|tiếp|thuốc này|cây này|bệnh này|sâu này|"
+    r"liều|liều lượng|pha|phun|xịt|dùng thuốc|trị thế nào|xử lý thế nào|"
+    r"bao nhiêu|mấy ngày|thì sao|sản phẩm|đầu tiên|cuối cùng|được liệt kê|"
+    r"thứ nhất|thứ hai|thứ ba|thứ tư|thứ năm)\b",
+    re.IGNORECASE,
+)
+_REFERENTIAL_RE = re.compile(
+    r"\b(?:này|đó|cây này|bệnh này|sâu này|trường hợp này|vừa nói)\b",
+    re.IGNORECASE,
+)
+
+
+def _should_link_conversation_context(
+    text_norm: str,
+    crop: str | None,
+    pest: str | None,
+    mention,
+    context: dict | None,
+) -> bool:
+    if not context or not any(
+        context.get(key) for key in ("crop", "pest", "product", "products", "turns")
+    ):
+        return False
+    if pest is not None and crop is None:
+        return True
+    if mention is not None:
+        return _REFERENTIAL_RE.search(text_norm) is not None
+    if crop is not None:
+        return re.search(r"\b(?:còn|thì sao|cây này|trường hợp này)\b", text_norm) is not None
+    return _FOLLOW_UP_RE.search(text_norm) is not None
+
+
+_PRODUCT_ORDINALS: tuple[tuple[re.Pattern, int], ...] = (
+    (re.compile(r"\b(?:đầu tiên|thứ nhất|thứ 1|số 1)\b", re.IGNORECASE), 0),
+    (re.compile(r"\b(?:thứ hai|thứ 2|số 2)\b", re.IGNORECASE), 1),
+    (re.compile(r"\b(?:thứ ba|thứ 3|số 3)\b", re.IGNORECASE), 2),
+    (re.compile(r"\b(?:thứ tư|thứ 4|số 4)\b", re.IGNORECASE), 3),
+    (re.compile(r"\b(?:thứ năm|thứ 5|số 5)\b", re.IGNORECASE), 4),
+    (re.compile(r"\bcuối cùng\b", re.IGNORECASE), -1),
+)
+
+
+def resolve_product_reference(
+    text: str, context: dict | None
+) -> tuple[str, str | None] | None:
+    """Resolve ordinal references only against products actually returned in-session."""
+    if not context:
+        return None
+    products = context.get("products") or []
+    if not products:
+        for turn in reversed(context.get("turns") or []):
+            products = (turn.get("assistant") or {}).get("products") or []
+            if products:
+                break
+    if not products:
+        return None
+    text_norm = _norm(text)
+    selected = None
+    for pattern, index in _PRODUCT_ORDINALS:
+        if pattern.search(text_norm) and -len(products) <= index < len(products):
+            selected = products[index]
+            break
+    if selected is None and len(products) == 1 and _REFERENTIAL_RE.search(text_norm):
+        selected = products[0]
+    if not isinstance(selected, dict):
+        return None
+    trade_name = str(selected.get("trade_name") or "").strip()
+    if not trade_name:
+        return None
+    formulation = str(selected.get("formulation") or "").strip() or None
+    return trade_name, formulation
+
 _SMALLTALK_PATTERNS: dict[str, tuple[str, ...]] = {
     "greeting": ("xin chào", "chào", "hello", "hi", "alo"),
     "thanks": ("cảm ơn", "cám ơn", "thank"),
@@ -373,6 +449,173 @@ def _abstain_lite_segments() -> list[dict]:
     ]
 
 
+def _web_fallback_response(
+    text: str,
+    region: str,
+    on_date: str,
+    crop: str | None,
+    pest: str | None,
+    reason: str,
+) -> dict | None:
+    """Call web grounding fail-closed; lỗi/thiếu citation trả None cho fallback cũ."""
+    from app.backend import web_grounding
+
+    if not web_grounding.enabled():
+        return None
+    try:
+        result = web_grounding.search_and_answer(
+            text,
+            region,
+            crop=crop,
+            pest=pest,
+            fallback_reason=reason,
+            on_date=on_date,
+        )
+    except Exception as exc:
+        logger.exception("Tavily Search fallback failed: %s", reason)
+        try:
+            import httpx
+
+            if isinstance(exc, httpx.ConnectError):
+                failure_text = (
+                    "Dạ, em đã thử tra cứu web nhưng hiện không thể kết nối tới Tavily Search. "
+                    "Bác vui lòng kiểm tra kết nối mạng hoặc cấu hình proxy của backend rồi thử lại."
+                )
+                failure_reason = "Không thể kết nối tới Tavily Search (lỗi mạng/proxy)."
+            elif isinstance(exc, httpx.TimeoutException):
+                failure_text = (
+                    "Dạ, Tavily Search phản hồi quá thời gian chờ nên em chưa thể tổng hợp "
+                    "câu trả lời có nguồn cho bác lúc này. Bác thử lại sau ít phút nhé."
+                )
+                failure_reason = "Tavily Search phản hồi quá thời gian chờ."
+            elif isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in {401, 403}:
+                failure_text = (
+                    "Dạ, Tavily Search từ chối xác thực API key. Bác vui lòng kiểm tra lại "
+                    "TAVILY_API_KEY trong cấu hình backend."
+                )
+                failure_reason = "Tavily Search từ chối API key."
+            elif (
+                isinstance(exc, httpx.HTTPStatusError)
+                and exc.response.status_code == 429
+            ) or "429" in str(exc):
+                failure_text = (
+                    "Dạ, Tavily Search đang giới hạn tần suất hoặc đã hết quota/hạn mức, "
+                    "nên em chưa thể tổng hợp câu trả lời có nguồn cho bác lúc này."
+                )
+                failure_reason = "Tavily Search đang giới hạn tần suất hoặc đã hết quota/hạn mức."
+            else:
+                failure_text = (
+                    "Dạ, em đã thử tra cứu web nhưng Tavily Search trả lỗi kỹ thuật, "
+                    "nên em chưa thể tổng hợp câu trả lời có nguồn cho bác lúc này."
+                )
+                failure_reason = "Tavily Search trả lỗi kỹ thuật."
+        except Exception:
+            failure_text = (
+                "Dạ, em đã thử tra cứu web nhưng Tavily Search trả lỗi kỹ thuật, "
+                "nên em chưa thể tổng hợp câu trả lời có nguồn cho bác lúc này."
+            )
+            failure_reason = "Tavily Search trả lỗi kỹ thuật."
+        return {
+            "risk_class": "B",
+            "answer_segments": [
+                {
+                    "type": "text",
+                    "content": failure_text,
+                },
+                {
+                    "type": "abstain",
+                    "reason": failure_reason,
+                    "handoff": True,
+                },
+            ],
+            "slots": {"crop": crop, "pest": pest, "region": region},
+            "products": [],
+        }
+    segments = web_grounding.answer_segments(result)
+    if not segments:
+        return None
+    # Web search is only reached after an internal database/KB miss.  Keep the
+    # grounded web answer, but make that data gap explicit and offer handoff.
+    segments = _append_database_gap_handoff(segments, reason)
+    return {
+        "risk_class": "B",
+        "answer_segments": segments,
+        "slots": {"crop": crop, "pest": pest, "region": region},
+        "products": [],
+    }
+
+
+def _registry_result_needs_web(result) -> tuple[bool, str]:
+    """Chỉ web-fallback khi tool chạy thành công nhưng thật sự không có dữ liệu.
+
+    ``not_registered`` là một kết luận âm có căn cứ từ registry, không phải thiếu
+    dữ liệu, nên tuyệt đối không cho web ghi đè kết luận đó.
+    """
+    from app.backend.schemas import (
+        ProductRegistrantResponse,
+        ProductRegistrationResponse,
+        ProductStatusResponse,
+        RegistrySearchResponse,
+    )
+
+    if isinstance(result, RegistrySearchResponse) and not result.products:
+        return True, "registry_has_no_registered_products"
+    if isinstance(result, ProductRegistrationResponse) and result.resolution == "not_found":
+        return True, result.reason_code
+    if isinstance(result, ProductStatusResponse) and result.resolution == "not_found":
+        return True, result.reason_code
+    if isinstance(result, ProductRegistrantResponse):
+        if result.resolution == "not_found" or (
+            result.resolution == "found" and not result.registrant
+        ):
+            return True, result.reason_code
+    return False, ""
+
+
+def _segments_abstained(segments: list[dict]) -> bool:
+    return any(segment.get("type") == "abstain" for segment in segments)
+
+
+def _database_gap_handoff(reason: str) -> dict:
+    """Create the user-facing handoff warning for an internal data gap.
+
+    A web answer or a registry placeholder may still be useful, but it must not
+    hide the fact that the requested fact was absent from the curated database.
+    """
+    missing_information = {
+        "labels_database_has_no_verified_dose": "liều dùng",
+        "registry_has_no_registered_products": "thông tin sản phẩm đăng ký",
+        "registry_product_has_no_registered_uses": "công dụng đã đăng ký của thuốc",
+        "unresolved_product_uses_question": "công dụng của thuốc",
+        "registry_product_ambiguous": "thông tin định danh chính xác của sản phẩm",
+        "registry_product_not_found": "thông tin sản phẩm",
+        "registrant_missing": "thông tin đơn vị đăng ký sản phẩm",
+        "cultivation_kb_has_no_crop_document": "quy trình canh tác cho cây trồng này",
+        "internal_rag_not_grounded": "thông tin tư vấn canh tác đã được xác minh",
+        "internal_rag_unavailable": "thông tin tư vấn canh tác",
+        "internal_knowledge_database_unavailable": "thông tin tư vấn canh tác",
+    }.get(reason, "thông tin cần tra cứu")
+    return {
+        "type": "handoff_warning",
+        "reason": (
+            f"Cơ sở dữ liệu của hệ thống chưa có đủ {missing_information}. "
+            "Bác nên liên hệ cán bộ khuyến nông để làm rõ trước khi áp dụng."
+        ),
+        "handoff": True,
+    }
+
+
+def _append_database_gap_handoff(segments: list[dict], reason: str) -> list[dict]:
+    """Append exactly one handoff warning without mutating the caller's list."""
+    result = list(segments)
+    if not any(
+        segment.get("type") in {"abstain", "handoff_warning"}
+        for segment in result
+    ):
+        result.append(_database_gap_handoff(reason))
+    return result
+
+
 def _out_of_kb_crop_segments(crop: str, region_name: str) -> list[dict]:
     """Minh bạch phạm vi khi câu có crop slot nhưng crop đó KHÔNG nằm trong danh sách
     cây có tài liệu KB (vd "táo") và không có pest slot đi kèm. Thay abstain-lite mù
@@ -400,7 +643,10 @@ def _mock_segments() -> list[dict]:
         "Phần tư vấn canh tác đang được kết nối nguồn chính thống, bác thử hỏi em theo mấy câu ví dụ "
         f"dưới đây để em tra đúng thuốc cho bác nhé:\n{goi_y}"
     )
-    return [{"type": "text", "content": content}]
+    return [
+        {"type": "text", "content": content},
+        _database_gap_handoff("internal_knowledge_database_unavailable"),
+    ]
 
 
 def _clarify_segments(ambiguous: tuple[str, str]) -> list[dict]:
@@ -453,8 +699,7 @@ def _path_a_segments(
     total_override: int | None = None,
 ) -> tuple[list[dict], list[dict]]:
     vocab = _load_vocab()
-    shown = hits[:MAX_PRODUCTS]
-    if not shown:
+    if not hits:
         content = (
             f"Em kiểm tra danh mục thuốc BVTV hiện hành nhưng chưa thấy sản phẩm nào đăng ký chính thức "
             f"cho \"{pest}\" trên \"{crop}\" ở {region_name}. Trong lúc chờ, bác giữ nguyên tắc 4 đúng "
@@ -470,21 +715,41 @@ def _path_a_segments(
         return segments, []
 
     lconn = _open_labels_conn()
+    verified_doses: dict[tuple[str, str], object] = {}
     try:
-        doses = [_lookup_dose(lconn, hit.trade_name, crop, pest, formulation=hit.formulation) for hit in shown]
+        if lconn is not None:
+            verified_doses = db_module.get_verified_doses(lconn, crop, pest)
+    except sqlite3.Error:
+        verified_doses = {}
     finally:
         if lconn is not None:
             lconn.close()
 
-    # Ưu tiên hiển thị: sản phẩm có dose verified xếp lên trước (nông dân cần liều
-    # dùng được ngay) — sorted() ổn định nên phần còn lại giữ nguyên thứ tự gốc.
-    order = sorted(range(len(shown)), key=lambda i: 0 if doses[i] is not None else 1)
-    shown = [shown[i] for i in order]
-    doses = [doses[i] for i in order]
+    verified_hits: list[tuple[object, object]] = []
+    for hit in hits:
+        key = (hit.trade_name.strip().casefold(), (hit.formulation or "").strip().casefold())
+        dose = verified_doses.get(key)
+        if dose is not None:
+            verified_hits.append((hit, dose))
+
+    # Nếu có dù chỉ một sản phẩm có liều verified thì chỉ hiển thị nhóm đó.
+    # Top registry không có liều chỉ là fallback khi toàn bộ tập kết quả thiếu liều.
+    selected = (
+        verified_hits[:MAX_PRODUCTS]
+        if verified_hits
+        else [(hit, None) for hit in hits[:MAX_PRODUCTS]]
+    )
+    shown = [item[0] for item in selected]
+    doses = [item[1] for item in selected]
 
     total = total_override if total_override is not None else len(hits)
     intro = f"Dạ, với {crop} bị {pest} ở {region_name}, em tìm được {total} sản phẩm còn phép dùng."
-    if total > len(shown):
+    if verified_hits:
+        intro += (
+            f" Trong đó có {len(verified_hits)} sản phẩm đã có liều lượng được xác thực; "
+            f"gửi bác {len(shown)} sản phẩm ưu tiên:"
+        )
+    elif total > len(shown):
         intro += f" Gửi bác {len(shown)} sản phẩm tiêu biểu, bác hỏi thêm cán bộ khuyến nông xã để chọn loại có sẵn tại đại lý gần nhà:"
     else:
         intro += " Gửi bác danh sách:"
@@ -529,6 +794,12 @@ def _path_a_segments(
 
     for cite in seen_cites:
         segments.append({"type": "citation", "source": cite, "url": _doc_url_for_cite(cite, vocab["doc_urls"])})
+
+    if not verified_hits:
+        segments = _append_database_gap_handoff(
+            segments,
+            "labels_database_has_no_verified_dose",
+        )
 
     return segments, products
 
@@ -622,13 +893,19 @@ def _render_registration_tool(result, region: str) -> dict:
             f"Dạ, có. {product_name} được đăng ký chính thức để phòng trừ {result.pest} trên "
             f"{result.crop} trong danh mục còn hiệu lực. Em chỉ trả đúng sản phẩm bác vừa hỏi:"
         )
+        segments = [
+            {"type": "text", "content": content},
+            _specific_dose_block(result),
+            _tool_citation(result.product),
+        ]
+        if result.dose is None:
+            segments = _append_database_gap_handoff(
+                segments,
+                "labels_database_has_no_verified_dose",
+            )
         return {
             "risk_class": "A",
-            "answer_segments": [
-                {"type": "text", "content": content},
-                _specific_dose_block(result),
-                _tool_citation(result.product),
-            ],
+            "answer_segments": segments,
             "slots": slots,
             "products": [_tool_product_payload(result.product)],
         }
@@ -700,7 +977,14 @@ def _render_registration_tool(result, region: str) -> dict:
         )
     return {
         "risk_class": "B",
-        "answer_segments": [{"type": "text", "content": message}],
+        "answer_segments": [
+            {"type": "text", "content": message},
+            _database_gap_handoff(
+                "registry_product_ambiguous"
+                if result.resolution == "ambiguous"
+                else "registry_product_not_found"
+            ),
+        ],
         "slots": slots,
         "products": [],
     }
@@ -757,6 +1041,47 @@ def _render_registrant_tool(result, region: str, crop: str | None, pest: str | N
         "slots": slots,
         # `products` represents recommendation cards and therefore stays empty
         # for a registrant-only factual answer (no unrelated dose card).
+        "products": [],
+    }
+
+
+def _render_product_uses_from_registry(
+    conn,
+    trade_name: str,
+    formulation: str | None,
+    on_date: str,
+    region: str,
+) -> dict | None:
+    """Trả công dụng đã đăng ký; chỉ trả khi định danh hiện hành là duy nhất và có uses."""
+    hits = db_module.lookup_exact_products(conn, trade_name, formulation, on_date)
+    if len(hits) != 1 or hits[0].status != "allowed":
+        return None
+    hit = hits[0]
+    uses = db_module.list_product_uses(conn, hit.product_id)
+    if not uses:
+        return None
+
+    grouped: dict[str, list[str]] = {}
+    for registered_crop, registered_pest in uses:
+        grouped.setdefault(registered_crop, []).append(registered_pest)
+    use_text = "; ".join(
+        f"{registered_crop}: {', '.join(registered_pests)}"
+        for registered_crop, registered_pests in grouped.items()
+    )
+    name = f"{hit.trade_name} {hit.formulation or ''}".strip()
+    return {
+        "risk_class": "A",
+        "answer_segments": [
+            {
+                "type": "text",
+                "content": (
+                    f"Dạ, theo danh mục hiện hành, {name} là thuốc trừ sâu chứa "
+                    f"{hit.active_ingredient}, được đăng ký phòng trừ: {use_text}."
+                ),
+            },
+            {"type": "citation", "source": hit.cite, "url": hit.source_url},
+        ],
+        "slots": {"crop": None, "pest": None, "region": region},
         "products": [],
     }
 
@@ -826,6 +1151,7 @@ def answer(
     session_id: str | None = None,
     _skip_input_review: bool = False,
     _resolved_payload: dict | None = None,
+    _conversation_context: dict | None = None,
 ) -> dict:
     # Input-review layer runs before crop/pest extraction so phonetic fragments
     # inside a product name ("a mít chưa", "ô đê") cannot steal those slots.
@@ -860,6 +1186,7 @@ def answer(
                         session_id=session_id,
                         _skip_input_review=True,
                         _resolved_payload=pending,
+                        _conversation_context=_conversation_context,
                     )
                 if intent == "no":
                     clarifications.clear(session_id)
@@ -867,7 +1194,12 @@ def answer(
                 # A non yes/no message is treated as a corrected/new question.
                 clarifications.clear(session_id)
 
-        review = input_resolver.review_input(text)
+        context_only_follow_up = bool(
+            _conversation_context
+            and _FOLLOW_UP_RE.search(_norm(text))
+            and product_guard.find_product_or_ai_mention(text) is None
+        )
+        review = None if context_only_follow_up else input_resolver.review_input(text)
         if review is not None:
             if session_id and review.action == "confirm":
                 clarifications.save(session_id, review.pending_payload())
@@ -888,14 +1220,36 @@ def answer(
         if pest is not None and crop is not None and pest == crop:
             pest = None  # phòng hờ thêm — không bao giờ chấp nhận pest == crop
 
+        mention = product_guard.find_product_or_ai_mention(text)
+        if _should_link_conversation_context(
+            text_norm, crop, pest, mention, _conversation_context
+        ):
+            if crop is None:
+                crop = _conversation_context.get("crop")
+            if pest is None:
+                pest = _conversation_context.get("pest")
+            referenced_product = resolve_product_reference(text, _conversation_context)
+            if mention is None and referenced_product is not None:
+                mention = ("product", referenced_product)
+            elif mention is None and _conversation_context.get("product"):
+                mention = (
+                    "product",
+                    (
+                        _conversation_context["product"],
+                        _conversation_context.get("formulation"),
+                    ),
+                )
+
         slots = {"crop": crop, "pest": pest, "region": region}
         region_name = REGION_NAMES.get(region, region)
+        multi_crop_note = None
+        if crop and len(crop_seen) > 1:
+            multi_crop_note = f"Bác nhắc tới cả {' và '.join(crop_seen)}, em trả lời cho {crop} trước nhé. "
 
         # --- P1-G: small-talk layer — chạy TRƯỚC clarify/product-guard/path A/path B.
         # Chỉ khi câu KHÔNG có slot nào (crop/pest/product mention) và ngắn (< 10 từ) —
         # tránh chặn nhầm câu thật có lẫn từ chào hỏi (vd "chào em, lúa bị rầy nâu xịt
         # gì" vẫn phải đi path A bình thường vì đã bắt được crop/pest).
-        mention = product_guard.find_product_or_ai_mention(text)
         if (
             crop is None
             and pest is None
@@ -960,28 +1314,99 @@ def answer(
             region=region,
             on_date=on_date,
         )
+        product_uses_question = registry_agent.is_product_uses_question(text)
+        if resolved_product and product_uses_question:
+            registry_uses_response = _render_product_uses_from_registry(
+                conn,
+                resolved_product,
+                resolved_formulation,
+                on_date,
+                region,
+            )
+            if registry_uses_response is not None:
+                return registry_uses_response
+
         decision = registry_agent.choose_tool(query)
         if decision is not None:
             try:
                 tool_result = registry_agent.execute_tool(decision, query, conn=conn)
+                needs_web, web_reason = _registry_result_needs_web(tool_result)
+                if needs_web:
+                    web_response = _web_fallback_response(
+                        text, region, on_date, crop, pest, web_reason
+                    )
+                    if web_response is not None:
+                        return web_response
+                if decision.tool_name == "list_registered_products":
+                    # Tool response is only a preview; dose priority must scan
+                    # every registered hit before applying the display top-k.
+                    all_hits = db_module.lookup_products(conn, crop, pest, on_date)
+                    segments, products = _path_a_segments(
+                        region_name,
+                        crop,
+                        pest,
+                        all_hits,
+                        multi_crop_note=multi_crop_note,
+                        total_override=tool_result.total,
+                    )
+                    return {
+                        "risk_class": "A",
+                        "answer_segments": segments,
+                        "slots": slots,
+                        "products": products,
+                    }
                 answer_plan = registry_agent.synthesize_plan(tool_result)
                 return _render_registry_tool(tool_result, answer_plan, region, crop, pest)
             except Exception:
                 return _tool_failure_response(region, crop, pest, "registry_tool_execution_failed")
 
-        multi_crop_note = None
-        if crop and len(crop_seen) > 1:
-            multi_crop_note = f"Bác nhắc tới cả {' và '.join(crop_seen)}, em trả lời cho {crop} trước nhé. "
+        # Có sản phẩm cụ thể nhưng không có registry tool phù hợp, hoặc câu có
+        # intent hỏi công dụng thuốc nhưng tên bị gõ sai/chưa resolve (vd
+        # "9x actinone dùng để làm gì") thì không đẩy sang KB canh tác chung.
+        # Tavily Search có thể tìm theo chính chuỗi người dùng và trả nguồn.
+        if resolved_product or product_uses_question:
+            reason = (
+                "registry_product_has_no_registered_uses"
+                if resolved_product
+                else "unresolved_product_uses_question"
+            )
+            web_response = _web_fallback_response(
+                text, region, on_date, crop, pest, reason
+            )
+            if web_response is not None:
+                return web_response
+            return {
+                "risk_class": "B",
+                "answer_segments": _abstain_lite_segments(),
+                "slots": slots,
+                "products": [],
+            }
 
         # --- P1-G: minh bạch phạm vi khi crop ngoài KB (chỉ khi KHÔNG có pest slot —
         # có pest thì để path A ở trên xử lý, registry.db độc lập với phạm vi KB) ---
         if crop and pest is None and crop not in _kb_crops():
             segments = _out_of_kb_crop_segments(crop, region_name)
+            web_response = _web_fallback_response(
+                text, region, on_date, crop, pest, "cultivation_kb_has_no_crop_document"
+            )
+            if web_response is not None:
+                return web_response
             return {"risk_class": "B", "answer_segments": segments, "slots": slots, "products": []}
 
         if _rag_b_enabled():
             segments = _rag_b_segments(text, region, crop)
+            if _segments_abstained(segments):
+                web_response = _web_fallback_response(
+                    text, region, on_date, crop, pest, "internal_rag_not_grounded"
+                )
+                if web_response is not None:
+                    return web_response
         else:
+            web_response = _web_fallback_response(
+                text, region, on_date, crop, pest, "internal_rag_unavailable"
+            )
+            if web_response is not None:
+                return web_response
             segments = _mock_segments()
         return {"risk_class": "B", "answer_segments": segments, "slots": slots, "products": []}
     finally:
