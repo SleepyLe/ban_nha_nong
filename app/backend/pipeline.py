@@ -269,6 +269,79 @@ def _crop_clarify_segments() -> list[dict]:
 # TRƯỚC clarify/product-guard/path A/path B, chỉ khi câu không có slot nào cả.
 _SMALLTALK_MAX_WORDS = 10
 
+_FOLLOW_UP_RE = re.compile(
+    r"\b(?:này|đó|vậy|thế|nó|còn|tiếp|thuốc này|cây này|bệnh này|sâu này|"
+    r"liều|liều lượng|pha|phun|xịt|dùng thuốc|trị thế nào|xử lý thế nào|"
+    r"bao nhiêu|mấy ngày|thì sao|sản phẩm|đầu tiên|cuối cùng|được liệt kê|"
+    r"thứ nhất|thứ hai|thứ ba|thứ tư|thứ năm)\b",
+    re.IGNORECASE,
+)
+_REFERENTIAL_RE = re.compile(
+    r"\b(?:này|đó|cây này|bệnh này|sâu này|trường hợp này|vừa nói)\b",
+    re.IGNORECASE,
+)
+
+
+def _should_link_conversation_context(
+    text_norm: str,
+    crop: str | None,
+    pest: str | None,
+    mention,
+    context: dict | None,
+) -> bool:
+    if not context or not any(
+        context.get(key) for key in ("crop", "pest", "product", "products", "turns")
+    ):
+        return False
+    if pest is not None and crop is None:
+        return True
+    if mention is not None:
+        return _REFERENTIAL_RE.search(text_norm) is not None
+    if crop is not None:
+        return re.search(r"\b(?:còn|thì sao|cây này|trường hợp này)\b", text_norm) is not None
+    return _FOLLOW_UP_RE.search(text_norm) is not None
+
+
+_PRODUCT_ORDINALS: tuple[tuple[re.Pattern, int], ...] = (
+    (re.compile(r"\b(?:đầu tiên|thứ nhất|thứ 1|số 1)\b", re.IGNORECASE), 0),
+    (re.compile(r"\b(?:thứ hai|thứ 2|số 2)\b", re.IGNORECASE), 1),
+    (re.compile(r"\b(?:thứ ba|thứ 3|số 3)\b", re.IGNORECASE), 2),
+    (re.compile(r"\b(?:thứ tư|thứ 4|số 4)\b", re.IGNORECASE), 3),
+    (re.compile(r"\b(?:thứ năm|thứ 5|số 5)\b", re.IGNORECASE), 4),
+    (re.compile(r"\bcuối cùng\b", re.IGNORECASE), -1),
+)
+
+
+def resolve_product_reference(
+    text: str, context: dict | None
+) -> tuple[str, str | None] | None:
+    """Resolve ordinal references only against products actually returned in-session."""
+    if not context:
+        return None
+    products = context.get("products") or []
+    if not products:
+        for turn in reversed(context.get("turns") or []):
+            products = (turn.get("assistant") or {}).get("products") or []
+            if products:
+                break
+    if not products:
+        return None
+    text_norm = _norm(text)
+    selected = None
+    for pattern, index in _PRODUCT_ORDINALS:
+        if pattern.search(text_norm) and -len(products) <= index < len(products):
+            selected = products[index]
+            break
+    if selected is None and len(products) == 1 and _REFERENTIAL_RE.search(text_norm):
+        selected = products[0]
+    if not isinstance(selected, dict):
+        return None
+    trade_name = str(selected.get("trade_name") or "").strip()
+    if not trade_name:
+        return None
+    formulation = str(selected.get("formulation") or "").strip() or None
+    return trade_name, formulation
+
 _SMALLTALK_PATTERNS: dict[str, tuple[str, ...]] = {
     "greeting": ("xin chào", "chào", "hello", "hi", "alo"),
     "thanks": ("cảm ơn", "cám ơn", "thank"),
@@ -994,6 +1067,7 @@ def answer(
     session_id: str | None = None,
     _skip_input_review: bool = False,
     _resolved_payload: dict | None = None,
+    _conversation_context: dict | None = None,
 ) -> dict:
     # Input-review layer runs before crop/pest extraction so phonetic fragments
     # inside a product name ("a mít chưa", "ô đê") cannot steal those slots.
@@ -1028,6 +1102,7 @@ def answer(
                         session_id=session_id,
                         _skip_input_review=True,
                         _resolved_payload=pending,
+                        _conversation_context=_conversation_context,
                     )
                 if intent == "no":
                     clarifications.clear(session_id)
@@ -1035,7 +1110,12 @@ def answer(
                 # A non yes/no message is treated as a corrected/new question.
                 clarifications.clear(session_id)
 
-        review = input_resolver.review_input(text)
+        context_only_follow_up = bool(
+            _conversation_context
+            and _FOLLOW_UP_RE.search(_norm(text))
+            and product_guard.find_product_or_ai_mention(text) is None
+        )
+        review = None if context_only_follow_up else input_resolver.review_input(text)
         if review is not None:
             if session_id and review.action == "confirm":
                 clarifications.save(session_id, review.pending_payload())
@@ -1056,6 +1136,26 @@ def answer(
         if pest is not None and crop is not None and pest == crop:
             pest = None  # phòng hờ thêm — không bao giờ chấp nhận pest == crop
 
+        mention = product_guard.find_product_or_ai_mention(text)
+        if _should_link_conversation_context(
+            text_norm, crop, pest, mention, _conversation_context
+        ):
+            if crop is None:
+                crop = _conversation_context.get("crop")
+            if pest is None:
+                pest = _conversation_context.get("pest")
+            referenced_product = resolve_product_reference(text, _conversation_context)
+            if mention is None and referenced_product is not None:
+                mention = ("product", referenced_product)
+            elif mention is None and _conversation_context.get("product"):
+                mention = (
+                    "product",
+                    (
+                        _conversation_context["product"],
+                        _conversation_context.get("formulation"),
+                    ),
+                )
+
         slots = {"crop": crop, "pest": pest, "region": region}
         region_name = REGION_NAMES.get(region, region)
 
@@ -1063,7 +1163,6 @@ def answer(
         # Chỉ khi câu KHÔNG có slot nào (crop/pest/product mention) và ngắn (< 10 từ) —
         # tránh chặn nhầm câu thật có lẫn từ chào hỏi (vd "chào em, lúa bị rầy nâu xịt
         # gì" vẫn phải đi path A bình thường vì đã bắt được crop/pest).
-        mention = product_guard.find_product_or_ai_mention(text)
         if (
             crop is None
             and pest is None

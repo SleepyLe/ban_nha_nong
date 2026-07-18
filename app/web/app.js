@@ -121,6 +121,10 @@ function makeId(prefix) {
 
 function makeSessionId() { return makeId("session"); }
 
+function validSessionId(value) {
+  return typeof value === "string" && value.length >= 8 && value.length <= 128;
+}
+
 function loadRegion() {
   const saved = localStorage.getItem(REGION_KEY);
   return REGION_META[saved] ? saved : "an_giang";
@@ -131,6 +135,7 @@ function repairLoadingMessages(conversations) {
     .filter((item) => item && item.id && Array.isArray(item.messages))
     .map((conversation) => ({
       ...conversation,
+      sessionId: validSessionId(conversation.sessionId) ? conversation.sessionId : makeSessionId(),
       messages: conversation.messages.map((message) => message.status === "loading" ? {
         ...message,
         status: "error",
@@ -147,7 +152,15 @@ async function loadConversationsFromServer() {
     let conversations = await response.json();
     if (!Array.isArray(conversations)) conversations = [];
     if (conversations.length === 0) conversations = await migrateLocalStorageOnce();
+    const missingSessionIds = new Set(
+      conversations.filter((item) => !validSessionId(item?.sessionId)).map((item) => item.id)
+    );
     state.conversations = repairLoadingMessages(conversations);
+    await Promise.all(
+      state.conversations
+        .filter((item) => missingSessionIds.has(item.id))
+        .map((item) => saveConversations(item))
+    );
     renderAll();
   } catch (_error) {
     setStatus("Không tải được lịch sử từ máy chủ.");
@@ -176,8 +189,8 @@ async function migrateLocalStorageOnce() {
 
 function saveConversations(conversation) {
   const target = conversation || getActiveConversation();
-  if (!target) return;
-  fetch(`/api/conversations/${encodeURIComponent(target.id)}`, {
+  if (!target) return Promise.resolve();
+  return fetch(`/api/conversations/${encodeURIComponent(target.id)}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(target),
@@ -1039,6 +1052,7 @@ function retryQuestion(messageId) {
 }
 
 async function askBackend(conversation, message) {
+  if (!validSessionId(conversation.sessionId)) conversation.sessionId = makeSessionId();
   state.isBusy = true;
   updateSendState();
   setStatus("Đang tra danh mục và nguồn địa phương...");
@@ -1055,7 +1069,12 @@ async function askBackend(conversation, message) {
     });
     const body = await safeJson(response);
     if (!response.ok) throw new Error(body.detail || "Máy chủ chưa xử lý được câu hỏi.");
+    if (validSessionId(body.session_id)) conversation.sessionId = body.session_id;
     message.answer = body;
+    const sessionTurnLimit = Number(body.session_turn_limit);
+    if (Number.isInteger(sessionTurnLimit) && sessionTurnLimit > 0 && conversation.messages.length > sessionTurnLimit) {
+      conversation.messages.splice(0, conversation.messages.length - sessionTurnLimit);
+    }
     message.error = null;
     message.status = "done";
   } catch (error) {

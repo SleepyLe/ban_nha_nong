@@ -12,7 +12,7 @@ Region = Literal["an_giang", "dak_lak"]
 class AskRequest(BaseModel):
     text: str = Field(default="", max_length=2000)
     region: Region
-    session_id: str | None = None
+    session_id: str | None = Field(default=None, min_length=8, max_length=128)
     attachment_ids: list[str] = Field(default_factory=list, max_length=3)
 
 
@@ -79,6 +79,8 @@ class ProductOut(BaseModel):
 
 
 class AskResponse(BaseModel):
+    session_id: str | None = None
+    session_turn_limit: int | None = None
     risk_class: Literal["A", "B", "C"]
     answer_segments: list[AnswerSegment]
     slots: Slots

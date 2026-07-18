@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import sqlite3
+import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -20,10 +21,12 @@ from fastapi.staticfiles import StaticFiles
 from app.backend import (
     asr,
     clarifications,
+    conversation_resolver,
     history,
     image_resolver,
     image_uploads,
     pipeline,
+    product_guard,
     registry_api,
     tts,
 )
@@ -75,6 +78,45 @@ def _handoff_conn() -> sqlite3.Connection:
 @app.post("/api/ask", response_model=AskResponse)
 def ask(req: AskRequest) -> AskResponse:
     text = req.text.strip()
+    original_text = text
+    session_id = req.session_id or f"session-{uuid.uuid4()}"
+    conversation_context = history.get_session_context(session_id)
+    pending_confirmation = clarifications.get(session_id)
+
+    def finish(result: dict) -> AskResponse:
+        explicit_product = None
+        mention = product_guard.find_product_or_ai_mention(text)
+        if mention is not None and mention[0] == "product":
+            explicit_product = mention[1]
+        elif conversation_context:
+            explicit_product = pipeline.resolve_product_reference(text, conversation_context)
+        if explicit_product is None and (
+            pending_confirmation
+            and clarifications.confirmation_intent(original_text) == "yes"
+            and pending_confirmation.get("product")
+        ):
+            pending_product = pending_confirmation["product"]
+            explicit_product = (
+                pending_product.get("canonical"),
+                pending_product.get("formulation"),
+            )
+        try:
+            history.record_session_turn(
+                session_id,
+                req.region,
+                original_text,
+                result,
+                explicit_product=explicit_product,
+                attachment_ids=req.attachment_ids,
+            )
+        except sqlite3.Error:
+            logger.exception("Could not persist conversation session context")
+        return AskResponse(
+            session_id=session_id,
+            session_turn_limit=history.session_turn_limit(),
+            **result,
+        )
+
     if not text and not req.attachment_ids:
         raise HTTPException(status_code=422, detail="Bác nhập câu hỏi hoặc chọn ít nhất một ảnh nhé.")
     if req.attachment_ids:
@@ -88,42 +130,49 @@ def ask(req: AskRequest) -> AskResponse:
             resolution = image_resolver.resolve_images(text, images)
         except Exception:
             logger.exception("Gemini multimodal input review failed")
-            return AskResponse(
-                risk_class="B",
-                answer_segments=[{
+            return finish({
+                "risk_class": "B",
+                "answer_segments": [{
                     "type": "text",
                     "content": (
                         "Dạ, em chưa phân tích được ảnh lúc này. Bác thử gửi lại ảnh hoặc "
                         "gõ tên cây, dấu hiệu hay tên thuốc trên nhãn giúp em nhé."
                     ),
                 }],
-                slots={"crop": None, "pest": None, "region": req.region},
-                products=[],
-            )
+                "slots": {"crop": None, "pest": None, "region": req.region},
+                "products": [],
+            })
         if resolution.review is not None:
             review = resolution.review
             if req.session_id and review.action == "confirm":
                 clarifications.save(req.session_id, review.pending_payload())
-            return AskResponse(
-                risk_class="B",
-                answer_segments=[{"type": "text", "content": review.message}],
-                slots={
+            return finish({
+                "risk_class": "B",
+                "answer_segments": [{"type": "text", "content": review.message}],
+                "slots": {
                     "crop": review.slots["crop"],
                     "pest": review.slots["pest"],
                     "region": req.region,
                 },
-                products=[],
-            )
+                "products": [],
+            })
         if resolution.message is not None:
-            return AskResponse(
-                risk_class="B",
-                answer_segments=[{"type": "text", "content": resolution.message}],
-                slots={"crop": None, "pest": None, "region": req.region},
-                products=[],
-            )
+            return finish({
+                "risk_class": "B",
+                "answer_segments": [{"type": "text", "content": resolution.message}],
+                "slots": {"crop": None, "pest": None, "region": req.region},
+                "products": [],
+            })
         text = resolution.augmented_text or text
-    result = pipeline.answer(text, req.region, date.today().isoformat(), session_id=req.session_id)
-    return AskResponse(**result)
+    text = conversation_resolver.contextualize(text, conversation_context)
+    result = pipeline.answer(
+        text,
+        req.region,
+        date.today().isoformat(),
+        session_id=session_id,
+        _conversation_context=conversation_context,
+    )
+    return finish(result)
 
 
 @app.post("/api/attachments/images", response_model=ImageUploadResponse)
