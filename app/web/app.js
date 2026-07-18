@@ -34,6 +34,17 @@ const state = {
   editingMessageId: null,
 };
 
+const speechState = {
+  button: null,
+  chunks: [],
+  index: 0,
+  token: 0,
+  speaking: false,
+  voice: null,
+  audio: null,
+  audioUrl: null,
+};
+
 const els = {};
 
 document.addEventListener("DOMContentLoaded", init);
@@ -378,6 +389,7 @@ function historyAction(iconName, label, action) {
 }
 
 function renderChat() {
+  stopSpeech();
   els.chat.replaceChildren();
   const conversation = getActiveConversation();
   if (!conversation || conversation.messages.length === 0) {
@@ -578,7 +590,267 @@ function renderAssistantMessage(message, conversation) {
   segments.filter((segment) => segment.type === "abstain").forEach((segment) => {
     row.appendChild(renderHandoff(segment, message.answer, message.text, conversation));
   });
+  const speechText = answerSpeechText(message.answer);
+  if (speechText) row.appendChild(renderSpeechButton(speechText));
   return row;
+}
+
+function speechSupported() {
+  return Boolean(
+    typeof window !== "undefined" &&
+    window.speechSynthesis &&
+    typeof window.SpeechSynthesisUtterance === "function"
+  );
+}
+
+function answerSpeechText(answer) {
+  const parts = [];
+  const segments = answer?.answer_segments || [];
+  segments.forEach((segment) => {
+    if (segment.type === "text" && segment.content) {
+      parts.push(segment.content);
+    } else if (segment.type === "dose_block") {
+      if (segment.product) parts.push(`Sản phẩm ${segment.product}.`);
+      if (segment.ai) parts.push(`Hoạt chất ${segment.ai}.`);
+      const guidance = segment.note || segment.dose_text;
+      if (guidance) parts.push(`${guidance}.`);
+    } else if (segment.type === "abstain" && segment.reason) {
+      parts.push(segment.reason);
+    }
+  });
+  return parts.join(" ").replace(/https?:\/\/\S+/gi, "").replace(/\s+/g, " ").trim();
+}
+
+function splitSpeechText(text, maxLength = 240) {
+  const sentences = String(text || "").match(/[^.!?…]+[.!?…]+|[^.!?…]+$/g) || [];
+  const chunks = [];
+  let current = "";
+
+  const pushWords = (sentence) => {
+    sentence.trim().split(/\s+/).forEach((word) => {
+      if (!word) return;
+      if (word.length > maxLength) {
+        if (current) { chunks.push(current); current = ""; }
+        for (let offset = 0; offset < word.length; offset += maxLength) {
+          chunks.push(word.slice(offset, offset + maxLength));
+        }
+        return;
+      }
+      const candidate = current ? `${current} ${word}` : word;
+      if (candidate.length > maxLength) {
+        if (current) chunks.push(current);
+        current = word;
+      } else {
+        current = candidate;
+      }
+    });
+  };
+
+  sentences.forEach((sentence) => {
+    const clean = sentence.trim();
+    if (!clean) return;
+    const candidate = current ? `${current} ${clean}` : clean;
+    if (candidate.length <= maxLength) {
+      current = candidate;
+    } else {
+      if (current) { chunks.push(current); current = ""; }
+      if (clean.length <= maxLength) current = clean;
+      else pushWords(clean);
+    }
+  });
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+function renderSpeechButton(text) {
+  const actions = document.createElement("div");
+  actions.className = "answer-actions";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "answer-speech-btn";
+  button.setAttribute("aria-label", "Đọc câu trả lời");
+  button.setAttribute("aria-pressed", "false");
+  setSpeechButtonState(button, false);
+  button.addEventListener("click", () => toggleSpeech(button, text));
+  actions.appendChild(button);
+  return actions;
+}
+
+function setSpeechButtonState(button, speaking) {
+  if (!button) return;
+  button.classList.toggle("is-speaking", speaking);
+  button.setAttribute("aria-pressed", String(speaking));
+  button.setAttribute("aria-label", speaking ? "Dừng đọc câu trả lời" : "Đọc câu trả lời");
+  button.replaceChildren(icon(speaking ? "stop" : "volume"), document.createTextNode(speaking ? "Dừng đọc" : "Đọc câu trả lời"));
+}
+
+function preferredVietnameseVoice() {
+  const voices = window.speechSynthesis.getVoices();
+  return voices.find((voice) => String(voice.lang).toLowerCase() === "vi-vn")
+    || voices.find((voice) => String(voice.lang).toLowerCase().startsWith("vi"))
+    || null;
+}
+
+function waitForVietnameseVoice(timeoutMs = 1600) {
+  const available = preferredVietnameseVoice();
+  if (available) return Promise.resolve(available);
+
+  return new Promise((resolve) => {
+    let finished = false;
+    const synth = window.speechSynthesis;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      synth.removeEventListener?.("voiceschanged", onVoicesChanged);
+      resolve(preferredVietnameseVoice());
+    };
+    const onVoicesChanged = () => {
+      if (preferredVietnameseVoice()) finish();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    synth.addEventListener?.("voiceschanged", onVoicesChanged);
+  });
+}
+
+function toggleSpeech(button, text) {
+  if (speechState.speaking && speechState.button === button) {
+    stopSpeech();
+    return;
+  }
+
+  stopSpeech();
+  speechState.chunks = splitSpeechText(text);
+  if (!speechState.chunks.length) return;
+  speechState.button = button;
+  speechState.index = 0;
+  speechState.speaking = true;
+  const token = speechState.token;
+  setSpeechButtonState(button, true);
+  if (!speechSupported()) {
+    void playGoogleSpeech(token, text);
+    return;
+  }
+  const availableVoice = preferredVietnameseVoice();
+  if (availableVoice) {
+    speechState.voice = availableVoice;
+    speakNextChunk(token);
+    return;
+  }
+
+  setStatus("Đang tải giọng đọc tiếng Việt...");
+  waitForVietnameseVoice().then((voice) => {
+    if (token !== speechState.token || !speechState.speaking) return;
+    if (!voice) {
+      void playGoogleSpeech(token, text);
+      return;
+    }
+    speechState.voice = voice;
+    setStatus("");
+    speakNextChunk(token);
+  });
+}
+
+async function playGoogleSpeech(token, text) {
+  if (token !== speechState.token || !speechState.speaking) return;
+  setStatus("Thiết bị chưa có giọng Việt, đang tạo giọng đọc Google...");
+  try {
+    const response = await fetch("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (!response.ok) {
+      const body = await safeJson(response);
+      throw new Error(body.detail || "Không tạo được giọng đọc Google.");
+    }
+    const blob = await response.blob();
+    if (token !== speechState.token || !speechState.speaking) return;
+    if (!blob.size) throw new Error("Máy chủ không trả về âm thanh.");
+
+    const audioUrl = window.URL.createObjectURL(blob);
+    const audio = new window.Audio(audioUrl);
+    speechState.audio = audio;
+    speechState.audioUrl = audioUrl;
+    audio.onended = () => {
+      if (token === speechState.token) finishSpeech(token);
+    };
+    audio.onerror = () => {
+      if (token !== speechState.token) return;
+      finishSpeech(token);
+      setStatus("Không phát được file giọng đọc Google.");
+    };
+    await audio.play();
+    if (token === speechState.token) setStatus("");
+  } catch (error) {
+    if (token !== speechState.token) return;
+    finishSpeech(token);
+    setStatus(error?.message || "Không tạo được giọng đọc tiếng Việt.");
+  }
+}
+
+function speakNextChunk(token) {
+  if (token !== speechState.token || !speechState.speaking) return;
+  if (speechState.index >= speechState.chunks.length) {
+    finishSpeech(token);
+    return;
+  }
+
+  const utterance = new window.SpeechSynthesisUtterance(speechState.chunks[speechState.index]);
+  utterance.lang = "vi-VN";
+  utterance.rate = 0.95;
+  // Không để trình duyệt tự fallback sang giọng tiếng Anh.
+  utterance.voice = speechState.voice;
+  utterance.onend = () => {
+    if (token !== speechState.token) return;
+    speechState.index += 1;
+    speakNextChunk(token);
+  };
+  utterance.onerror = (event) => {
+    if (token !== speechState.token) return;
+    const expectedStop = event.error === "canceled" || event.error === "interrupted";
+    finishSpeech(token);
+    if (!expectedStop) setStatus("Không thể phát giọng đọc trên trình duyệt này.");
+  };
+  window.speechSynthesis.speak(utterance);
+}
+
+function finishSpeech(token) {
+  if (token !== speechState.token) return;
+  cleanupGoogleAudio();
+  setSpeechButtonState(speechState.button, false);
+  speechState.button = null;
+  speechState.chunks = [];
+  speechState.index = 0;
+  speechState.speaking = false;
+  speechState.voice = null;
+}
+
+function cleanupGoogleAudio() {
+  if (speechState.audio) {
+    speechState.audio.onended = null;
+    speechState.audio.onerror = null;
+    speechState.audio.pause();
+    speechState.audio.currentTime = 0;
+    speechState.audio = null;
+  }
+  if (speechState.audioUrl) {
+    window.URL.revokeObjectURL(speechState.audioUrl);
+    speechState.audioUrl = null;
+  }
+}
+
+function stopSpeech() {
+  const oldButton = speechState.button;
+  speechState.token += 1;
+  if (speechSupported()) window.speechSynthesis.cancel();
+  cleanupGoogleAudio();
+  speechState.button = null;
+  speechState.chunks = [];
+  speechState.index = 0;
+  speechState.speaking = false;
+  speechState.voice = null;
+  setSpeechButtonState(oldButton, false);
 }
 
 function renderDoseList(segments, region) {
@@ -777,82 +1049,168 @@ function setupMic() {
   let chunks = [];
   let stream = null;
   let autoStopTimer = null;
+  let phase = "idle";
+  let sendOnStop = true;
+
+  function updateMicButton(nextPhase) {
+    phase = nextPhase;
+    const recording = phase === "recording";
+    const waiting = phase === "requesting" || phase === "stopping";
+    if (recording) els.micBtn.classList.add("is-recording");
+    else els.micBtn.classList.remove("is-recording");
+    if (waiting) els.micBtn.classList.add("is-requesting");
+    else els.micBtn.classList.remove("is-requesting");
+    els.micBtn.setAttribute("aria-pressed", recording ? "true" : "false");
+    els.micBtn.setAttribute("aria-busy", waiting ? "true" : "false");
+
+    if (recording) {
+      els.micBtn.setAttribute("aria-label", "Dừng và gửi giọng nói");
+      els.micBtn.title = "Dừng và gửi";
+    } else if (phase === "requesting") {
+      els.micBtn.setAttribute("aria-label", "Đang mở micro");
+      els.micBtn.title = "Đang mở micro";
+    } else if (phase === "stopping") {
+      els.micBtn.setAttribute("aria-label", "Đang hoàn tất ghi âm");
+      els.micBtn.title = "Đang hoàn tất";
+    } else {
+      els.micBtn.setAttribute("aria-label", "Bắt đầu ghi âm");
+      els.micBtn.title = "Nhấn để nói";
+    }
+  }
+
+  function stopStreamTracks(targetStream) {
+    if (targetStream) targetStream.getTracks().forEach((track) => track.stop());
+  }
+
+  function micErrorMessage(error) {
+    if (error?.name === "NotFoundError") return "Không tìm thấy micro trên thiết bị này.";
+    if (error?.name === "NotReadableError") return "Micro đang được ứng dụng khác sử dụng.";
+    if (error?.name === "NotAllowedError" || error?.name === "SecurityError") {
+      return "Chưa có quyền dùng mic. Bác hãy cho phép micro rồi thử lại.";
+    }
+    return "Không mở được micro. Bác có thể gõ câu hỏi hoặc thử tải lại trang.";
+  }
 
   async function start() {
-    if (state.isBusy || els.micBtn.classList.contains("is-recording")) return;
+    if (state.isBusy || phase !== "idle") return;
     if (!navigator.mediaDevices || !window.MediaRecorder) {
       setStatus("Trình duyệt này chưa hỗ trợ ghi âm.");
       els.textInput.focus();
       return;
     }
+    updateMicButton("requesting");
+    setStatus("Đang mở micro...");
+    let requestedStream = null;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"].find(
+      requestedStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Nếu trạng thái đã bị hủy trong lúc hộp thoại quyền đang mở, không được
+      // khởi động một recorder muộn ngoài ý muốn của người dùng.
+      if (phase !== "requesting") {
+        stopStreamTracks(requestedStream);
+        return;
+      }
+      stream = requestedStream;
+      const mimeType = [
+        "audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4",
+      ].find(
         (type) => window.MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(type)
       );
       mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
       chunks = [];
+      sendOnStop = true;
+      const recorder = mediaRecorder;
       mediaRecorder.addEventListener("dataavailable", (event) => {
         if (event.data && event.data.size > 0) chunks.push(event.data);
       });
-      mediaRecorder.addEventListener("stop", onRecordingStopped);
+      mediaRecorder.addEventListener("stop", () => { void onRecordingStopped(recorder); });
+      mediaRecorder.addEventListener("error", () => {
+        sendOnStop = false;
+        setStatus("Ghi âm bị gián đoạn. Bác thử lại nhé.");
+        if (phase === "recording") stop({ send: false });
+      });
       mediaRecorder.start();
-      els.micBtn.classList.add("is-recording");
-      els.micBtn.setAttribute("aria-label", "Thả để gửi giọng nói");
-      setStatus("Đang nghe... thả nút mic để gửi.");
-      autoStopTimer = setTimeout(stop, 15000);
-    } catch (_error) {
-      setStatus("Chưa có quyền dùng mic. Bác có thể gõ câu hỏi.");
+      updateMicButton("recording");
+      setStatus("Đang nghe... nhấn lại nút mic để dừng và gửi.");
+      autoStopTimer = setTimeout(() => {
+        if (phase === "recording") stop();
+      }, 15000);
+    } catch (error) {
+      stopStreamTracks(requestedStream);
+      stream = null;
+      mediaRecorder = null;
+      updateMicButton("idle");
+      setStatus(micErrorMessage(error));
       els.textInput.focus();
     }
   }
 
-  function stop() {
+  function stop({ send = true } = {}) {
+    if (phase !== "recording" || !mediaRecorder) return;
     clearTimeout(autoStopTimer);
-    if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
-    if (stream) {
-      stream.getTracks().forEach((track) => track.stop());
-      stream = null;
+    autoStopTimer = null;
+    sendOnStop = send;
+    updateMicButton("stopping");
+    const recorder = mediaRecorder;
+    if (recorder.state !== "inactive") {
+      recorder.stop();
+    } else {
+      void onRecordingStopped(recorder);
     }
-    els.micBtn.classList.remove("is-recording");
-    els.micBtn.setAttribute("aria-label", "Giữ để nói");
   }
 
-  async function onRecordingStopped() {
-    if (!chunks.length) {
+  async function onRecordingStopped(recorder) {
+    // Bỏ event trễ của một recorder đã được hoàn tất trước đó.
+    if (recorder !== mediaRecorder) return;
+    clearTimeout(autoStopTimer);
+    autoStopTimer = null;
+    const recordedChunks = chunks;
+    const shouldSend = sendOnStop;
+    const blobType = recorder.mimeType || "audio/webm";
+    chunks = [];
+    mediaRecorder = null;
+    stopStreamTracks(stream);
+    stream = null;
+    updateMicButton("idle");
+
+    if (!shouldSend) return;
+    if (!recordedChunks.length) {
       setStatus("Không nghe được nội dung. Bác thử lại nhé.");
       return;
     }
-    const blob = new Blob(chunks, { type: mediaRecorder.mimeType || "audio/webm" });
-    chunks = [];
+    const blob = new Blob(recordedChunks, { type: blobType });
     await sendAudioForTranscription(blob);
   }
 
-  els.micBtn.addEventListener("pointerdown", (event) => {
+  // Click-to-toggle: một cú tap bắt đầu ghi và không còn bị pointerup dừng ngay;
+  // tap lần hai mới dừng/gửi. Sự kiện click chuẩn cũng hỗ trợ Enter/Space cho
+  // người dùng bàn phím mà không cần hai nhánh keydown/keyup dễ tạo race.
+  els.micBtn.addEventListener("click", (event) => {
     event.preventDefault();
-    els.micBtn.setPointerCapture?.(event.pointerId);
-    start();
-  });
-  ["pointerup", "pointercancel"].forEach((name) => {
-    els.micBtn.addEventListener(name, () => {
-      if (els.micBtn.classList.contains("is-recording")) stop();
-    });
-  });
-  els.micBtn.addEventListener("keydown", (event) => {
-    if ((event.key === " " || event.key === "Enter") && !event.repeat) {
-      event.preventDefault();
-      start();
-    }
-  });
-  els.micBtn.addEventListener("keyup", (event) => {
-    if (event.key === " " || event.key === "Enter") {
-      event.preventDefault();
-      if (els.micBtn.classList.contains("is-recording")) stop();
-    }
+    if (phase === "recording") stop();
+    else if (phase === "idle") void start();
   });
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden && els.micBtn.classList.contains("is-recording")) stop();
+    if (document.hidden && phase === "requesting") {
+      // Hộp thoại quyền có thể hoàn tất sau khi người dùng đã rời trang. Đổi
+      // phase để start() nhận ra request cũ và đóng stream ngay khi nó resolve.
+      updateMicButton("idle");
+      setStatus("Đã hủy mở micro vì ứng dụng chuyển sang nền.");
+      return;
+    }
+    if (document.hidden && phase === "recording") {
+      setStatus("Ghi âm đã dừng vì ứng dụng chuyển sang nền.");
+      stop({ send: false });
+    }
   });
+  updateMicButton("idle");
+}
+
+function audioFileName(mimeType) {
+  const normalized = String(mimeType || "").toLowerCase();
+  if (normalized.includes("ogg")) return "clip.ogg";
+  if (normalized.includes("mp4") || normalized.includes("m4a")) return "clip.m4a";
+  if (normalized.includes("wav")) return "clip.wav";
+  return "clip.webm";
 }
 
 async function sendAudioForTranscription(blob) {
@@ -861,7 +1219,7 @@ async function sendAudioForTranscription(blob) {
   setStatus("Đang nhận diện giọng nói...");
   try {
     const form = new FormData();
-    form.append("audio", blob, "clip.webm");
+    form.append("audio", blob, audioFileName(blob.type));
     const response = await fetch("/api/transcribe", { method: "POST", body: form });
     const body = await safeJson(response);
     if (!response.ok) throw new Error(body.detail || "Không nhận diện được giọng nói.");
@@ -886,6 +1244,7 @@ function autoSizeTextarea(textarea) {
 function updateSendState() {
   els.sendTextBtn.disabled = state.isBusy || !els.textInput.value.trim();
   els.textInput.disabled = state.isBusy;
+  els.micBtn.disabled = state.isBusy;
 }
 
 function setStatus(message) { els.statusLine.textContent = message || ""; }
