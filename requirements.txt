@@ -1,6 +1,7 @@
 pdfplumber==0.11.*
 httpx==0.28.*
 beautifulsoup4==4.12.*
+Pillow==12.*
 rapidfuzz==3.*
 pyvi==0.1.*
 pytest==8.*

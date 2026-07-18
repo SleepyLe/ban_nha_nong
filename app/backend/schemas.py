@@ -10,9 +10,25 @@ Region = Literal["an_giang", "dak_lak"]
 
 
 class AskRequest(BaseModel):
-    text: str
+    text: str = Field(default="", max_length=2000)
     region: Region
     session_id: str | None = None
+    attachment_ids: list[str] = Field(default_factory=list, max_length=3)
+
+
+class ImageAttachmentOut(BaseModel):
+    attachment_id: str
+    original_name: str
+    media_type: Literal["image/jpeg", "image/png", "image/webp"]
+    size: int
+    width: int
+    height: int
+    expires_at: str
+    url: str
+
+
+class ImageUploadResponse(BaseModel):
+    attachments: list[ImageAttachmentOut]
 
 
 class TextSegment(BaseModel):

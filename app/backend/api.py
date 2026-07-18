@@ -14,14 +14,25 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Response, UploadFile
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.backend import asr, history, pipeline, registry_api, tts
+from app.backend import (
+    asr,
+    clarifications,
+    history,
+    image_resolver,
+    image_uploads,
+    pipeline,
+    registry_api,
+    tts,
+)
 from app.backend.schemas import (
     AskRequest,
     AskResponse,
     HandoffRequest,
     HandoffResponse,
+    ImageUploadResponse,
     TranscribeResponse,
     TtsRequest,
 )
@@ -63,8 +74,84 @@ def _handoff_conn() -> sqlite3.Connection:
 
 @app.post("/api/ask", response_model=AskResponse)
 def ask(req: AskRequest) -> AskResponse:
-    result = pipeline.answer(req.text, req.region, date.today().isoformat(), session_id=req.session_id)
+    text = req.text.strip()
+    if not text and not req.attachment_ids:
+        raise HTTPException(status_code=422, detail="Bác nhập câu hỏi hoặc chọn ít nhất một ảnh nhé.")
+    if req.attachment_ids:
+        try:
+            images = image_uploads.load_images(req.attachment_ids)
+        except image_uploads.ImageUploadError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except image_uploads.AttachmentNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        try:
+            resolution = image_resolver.resolve_images(text, images)
+        except Exception:
+            logger.exception("Gemini multimodal input review failed")
+            return AskResponse(
+                risk_class="B",
+                answer_segments=[{
+                    "type": "text",
+                    "content": (
+                        "Dạ, em chưa phân tích được ảnh lúc này. Bác thử gửi lại ảnh hoặc "
+                        "gõ tên cây, dấu hiệu hay tên thuốc trên nhãn giúp em nhé."
+                    ),
+                }],
+                slots={"crop": None, "pest": None, "region": req.region},
+                products=[],
+            )
+        if resolution.review is not None:
+            review = resolution.review
+            if req.session_id and review.action == "confirm":
+                clarifications.save(req.session_id, review.pending_payload())
+            return AskResponse(
+                risk_class="B",
+                answer_segments=[{"type": "text", "content": review.message}],
+                slots={
+                    "crop": review.slots["crop"],
+                    "pest": review.slots["pest"],
+                    "region": req.region,
+                },
+                products=[],
+            )
+        if resolution.message is not None:
+            return AskResponse(
+                risk_class="B",
+                answer_segments=[{"type": "text", "content": resolution.message}],
+                slots={"crop": None, "pest": None, "region": req.region},
+                products=[],
+            )
+        text = resolution.augmented_text or text
+    result = pipeline.answer(text, req.region, date.today().isoformat(), session_id=req.session_id)
     return AskResponse(**result)
+
+
+@app.post("/api/attachments/images", response_model=ImageUploadResponse)
+async def upload_images(images: list[UploadFile] = File(...)) -> ImageUploadResponse:
+    if not images or len(images) > image_uploads.MAX_IMAGES_PER_QUESTION:
+        raise HTTPException(status_code=422, detail="Mỗi câu hỏi được gửi từ 1 đến 3 ảnh.")
+    attachments = []
+    for image in images:
+        data = await image.read(image_uploads.MAX_IMAGE_BYTES + 1)
+        try:
+            record = image_uploads.store_image(image.filename or "image", data)
+        except image_uploads.ImageUploadError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        attachments.append(record.public_dict())
+    return ImageUploadResponse(attachments=attachments)
+
+
+@app.get("/api/attachments/images/{attachment_id}")
+def get_uploaded_image(attachment_id: str) -> FileResponse:
+    try:
+        record = image_uploads.get_stored_image(attachment_id)
+    except image_uploads.AttachmentNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(
+        path=record.path,
+        media_type=record.media_type,
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
 
 
 @app.post("/api/transcribe", response_model=TranscribeResponse)
