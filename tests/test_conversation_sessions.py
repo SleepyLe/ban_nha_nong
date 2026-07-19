@@ -186,3 +186,66 @@ def test_tham_chieu_san_pham_dau_tien_trong_danh_sach():
     assert first_name in answer_text
     assert second_name not in answer_text
     assert "đơn vị đăng ký" in answer_text.casefold()
+
+
+def test_tra_loi_ngan_sau_cau_clarify_duoc_ghep_ngu_canh():
+    """Bot vừa hỏi lại ("cây gì?") -> câu đáp ngắn "lúa" phải được ghép thành câu
+    độc lập thay vì bị coi là câu hỏi mới (bug demo: trả về trivia An Giang)."""
+    from app.backend import conversation_resolver
+
+    class _FakeResp:
+        text = '{"is_follow_up": true, "standalone_text": "folpal 50WP dùng cho lúa còn được phép sử dụng không?"}'
+
+    class _FakeModels:
+        def generate_content(self, **kwargs):
+            return _FakeResp()
+
+    class _FakeClient:
+        models = _FakeModels()
+
+    context = {
+        "turns": [
+            {
+                "user_text": "folpal 50WP còn dùng được không",
+                "assistant": {
+                    "answer_segments": [
+                        {
+                            "type": "text",
+                            "content": "Dạ, bác cho em biết đang trồng cây gì (lúa, cà phê, sầu riêng...) để em tra đúng thông tin cho bác nhé?",
+                        }
+                    ],
+                    "slots": {},
+                    "products": [],
+                },
+            }
+        ]
+    }
+    out = conversation_resolver.contextualize("lúa", context, client=_FakeClient())
+    assert out == "folpal 50WP dùng cho lúa còn được phép sử dụng không?"
+
+
+def test_cau_ngan_khong_co_clarify_truoc_khong_bi_ghep():
+    """Không có câu hỏi lại ở lượt trước -> câu ngắn giữ nguyên, không gọi model."""
+    from app.backend import conversation_resolver
+
+    class _ExplodingClient:
+        class models:  # noqa: N801
+            @staticmethod
+            def generate_content(**kwargs):
+                raise AssertionError("không được gọi model khi gate đóng")
+
+    context = {
+        "turns": [
+            {
+                "user_text": "lúa bị rầy nâu xịt thuốc gì",
+                "assistant": {
+                    "answer_segments": [
+                        {"type": "text", "content": "Dạ, em tìm được 627 sản phẩm còn phép dùng."}
+                    ],
+                    "slots": {},
+                    "products": [],
+                },
+            }
+        ]
+    }
+    assert conversation_resolver.contextualize("lúa", context, client=_ExplodingClient()) == "lúa"

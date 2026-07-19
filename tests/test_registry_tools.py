@@ -204,3 +204,65 @@ def test_exact_product_question_and_registrant_question_use_specific_tools():
     text = " ".join(segment.get("content", "") for segment in registrant["answer_segments"])
     assert "Công ty TNHH Syngenta Việt Nam" in text
     assert not any(segment["type"] == "dose_block" for segment in registrant["answer_segments"])
+
+
+def test_status_tool_ambiguous_liet_ke_quy_cach():
+    """Sản phẩm trùng tên nhiều quy cách (Folpan 50WP/50SC) -> hỏi lại kèm danh sách
+    quy cách thật, không trả câu lỗi chung chung. Cần data/registry.db thật."""
+    import pathlib
+    from datetime import date as date_cls
+    from types import SimpleNamespace
+
+    import pytest
+
+    from app.backend import pipeline
+
+    if not pathlib.Path("data/registry.db").exists():
+        pytest.skip("registry.db chưa có (data private)")
+
+    result = SimpleNamespace(
+        resolution="ambiguous",
+        product=None,
+        trade_name="Folpan",
+        formulation=None,
+        on_date=date_cls(2026, 7, 19),
+        reason_code="exact_product_ambiguous",
+        legal_status="unknown",
+    )
+    out = pipeline._render_status_tool(result, "an_giang", None, None)
+    text = out["answer_segments"][0]["content"]
+    assert "50WP" in text and "50SC" in text
+    assert "quy cách" in text
+
+
+def test_dose_intent_khong_roi_vao_legal_status():
+    """Hỏi liều/cách ly một sản phẩm (không kèm cây/dịch hại) không được trả lời
+    bằng câu trạng thái pháp lý (bug demo: lặp lại 'còn được phép sử dụng')."""
+    import pathlib
+
+    import pytest
+    from fastapi.testclient import TestClient
+
+    from app.backend import registry_agent
+    from app.backend.api import app
+
+    # Intent detector: nhận cụm liều/cách ly, không nhận "liệu" trần
+    assert registry_agent.is_product_dose_question("liều dùng của nó như thế nào và ngày cách ly")
+    assert registry_agent.is_product_dose_question("pha bao nhiêu cho bình 25 lít")
+    assert not registry_agent.is_product_dose_question("liệu có nên phun sớm không")
+
+    if not pathlib.Path("data/registry.db").exists():
+        pytest.skip("registry.db chưa có (data private)")
+
+    client = TestClient(app)
+    resp = client.post(
+        "/api/ask",
+        json={"text": "liều dùng của Tung rice 300EC như thế nào và ngày cách ly", "region": "an_giang"},
+    )
+    assert resp.status_code == 200
+    segments = resp.json()["answer_segments"]
+    types = [s["type"] for s in segments]
+    joined = " ".join(s.get("content") or "" for s in segments if s["type"] == "text")
+    # Phải đi luồng liều (dose_block) chứ không phải chỉ câu trạng thái pháp lý
+    assert "dose_block" in types
+    assert "còn được phép sử dụng theo danh mục hiện hành" not in joined

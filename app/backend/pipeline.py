@@ -990,9 +990,50 @@ def _render_registration_tool(result, region: str) -> dict:
     }
 
 
+def _ambiguous_product_status_response(result, region: str, crop: str | None, pest: str | None) -> dict:
+    """Trùng tên nhiều quy cách (vd Folpan 50WP vs 50SC) — bà con thường chỉ nhớ tên
+    gọn, nên hỏi lại kèm DANH SÁCH quy cách thật từ danh mục thay vì câu lỗi chung."""
+    slots = {"crop": crop, "pest": pest, "region": region}
+    variants: list[str] = []
+    try:
+        conn = db_module.connect()
+        try:
+            hits = db_module.lookup_exact_products(
+                conn, result.trade_name, None, result.on_date.isoformat()
+            )
+            for hit in hits:
+                formulation = (hit.formulation or "").strip()
+                if formulation and formulation not in variants:
+                    variants.append(formulation)
+        finally:
+            conn.close()
+    except Exception:
+        logger.exception("Không liệt kê được quy cách cho sản phẩm trùng tên")
+    if variants:
+        vi_du = f"{result.trade_name} {variants[0]}"
+        message = (
+            f"Dạ, tên {result.trade_name} có {len(variants)} quy cách trong danh mục: "
+            f"{', '.join(variants)}. Bác xem trên nhãn chai là loại nào rồi hỏi lại "
+            f"đầy đủ giúp em (ví dụ \"{vi_du}\") để em tra chính xác nhé."
+        )
+    else:
+        message = (
+            f"Em thấy tên {result.trade_name} có nhiều định danh khác nhau trong danh mục. "
+            "Bác cho em đúng quy cách ghi trên nhãn để em không tra nhầm nhé."
+        )
+    return {
+        "risk_class": "B",
+        "answer_segments": [{"type": "text", "content": message}],
+        "slots": slots,
+        "products": [],
+    }
+
+
 def _render_status_tool(result, region: str, crop: str | None, pest: str | None) -> dict:
     slots = {"crop": crop, "pest": pest, "region": region}
     name = f"{result.trade_name} {result.formulation or ''}".strip()
+    if result.resolution == "ambiguous":
+        return _ambiguous_product_status_response(result, region, crop, pest)
     if result.resolution != "found" or result.product is None:
         return _tool_failure_response(region, crop, pest, result.reason_code)
     if result.legal_status == "transitional":
@@ -1079,6 +1120,68 @@ def _render_product_uses_from_registry(
                     f"{hit.active_ingredient}, được đăng ký phòng trừ: {use_text}."
                 ),
             },
+            {"type": "citation", "source": hit.cite, "url": hit.source_url},
+        ],
+        "slots": {"crop": None, "pest": None, "region": region},
+        "products": [],
+    }
+
+
+def _render_product_dose_from_registry(
+    conn,
+    trade_name: str,
+    formulation: str | None,
+    on_date: str,
+    region: str,
+) -> dict | None:
+    """Hỏi liều/ngày cách ly cho MỘT sản phẩm nhưng chưa nói cây/dịch hại.
+
+    Nguyên tắc: liều chỉ hợp lệ theo đúng (cây, dịch hại, quy cách) — không bao giờ
+    trả liều chung chung. Đúng 1 công dụng đăng ký -> đi luồng tra liều chuẩn;
+    nhiều công dụng -> hỏi lại kèm danh sách (câu đáp ngắn sẽ được ghép ngữ cảnh);
+    không xác định được -> None để đi luồng thường.
+    """
+    hits = db_module.lookup_exact_products(conn, trade_name, formulation, on_date)
+    if len(hits) != 1 or hits[0].status != "allowed":
+        return None
+    hit = hits[0]
+    uses = db_module.list_product_uses(conn, hit.product_id)
+    if not uses:
+        return None
+    name = f"{hit.trade_name} {hit.formulation or ''}".strip()
+    if len(uses) == 1:
+        from datetime import date as date_cls
+
+        from app.backend import registry_service  # import lười như các nhánh khác
+        from app.backend.schemas import ProductRegistrationRequest
+
+        request = ProductRegistrationRequest(
+            trade_name=hit.trade_name,
+            formulation=hit.formulation,
+            crop=uses[0][0],
+            pest=uses[0][1],
+            on_date=date_cls.fromisoformat(on_date),
+        )
+        result = registry_service.check_product_registration(request, conn=conn)
+        return _render_registration_tool(result, region)
+
+    grouped: dict[str, list[str]] = {}
+    for registered_crop, registered_pest in uses:
+        grouped.setdefault(registered_crop, []).append(registered_pest)
+    use_text = "; ".join(
+        f"{registered_crop}: {', '.join(registered_pests)}"
+        for registered_crop, registered_pests in list(grouped.items())[:8]
+    )
+    content = (
+        f"Dạ, liều và ngày cách ly của {name} phụ thuộc vào ĐÚNG cây trồng và dịch hại "
+        f"— em không trả liều chung chung kẻo bác dùng sai. {name} đang đăng ký cho: "
+        f"{use_text}. Bác cho em biết đang dùng cho cây nào, trị sâu/bệnh gì để em tra "
+        "liều đúng theo nhãn nhé."
+    )
+    return {
+        "risk_class": "A",
+        "answer_segments": [
+            {"type": "text", "content": content},
             {"type": "citation", "source": hit.cite, "url": hit.source_url},
         ],
         "slots": {"crop": None, "pest": None, "region": region},
@@ -1325,6 +1428,19 @@ def answer(
             )
             if registry_uses_response is not None:
                 return registry_uses_response
+
+        # Hỏi liều/cách ly một sản phẩm mà chưa rõ cây/dịch hại: KHÔNG được rơi vào
+        # catch-all legal-status (bug demo: lặp lại câu trạng thái pháp lý).
+        if (
+            resolved_product
+            and not (crop and pest)
+            and registry_agent.is_product_dose_question(text)
+        ):
+            dose_response = _render_product_dose_from_registry(
+                conn, resolved_product, resolved_formulation, on_date, region
+            )
+            if dose_response is not None:
+                return dose_response
 
         decision = registry_agent.choose_tool(query)
         if decision is not None:

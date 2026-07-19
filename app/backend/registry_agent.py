@@ -45,6 +45,14 @@ _PRODUCT_USES_RE = re.compile(
     r"tri sau gi|phong tru gi|dac tri gi)\b"
 )
 
+# Intent hỏi liều dùng / ngày cách ly. KHÔNG match "lieu" trần vì "liệu" (liệu có
+# nên...) fold ra cùng chuỗi — chỉ nhận các cụm rõ nghĩa.
+_PRODUCT_DOSE_RE = re.compile(
+    r"\b(?:lieu dung|lieu luong|lieu bao nhieu|lieu nhu the nao|lieu the nao|"
+    r"dung lieu|pha bao nhieu|pha nhu the nao|pha the nao|phun bao nhieu|"
+    r"ngay cach ly|thoi gian cach ly|cach ly bao nhieu|cach ly may ngay)\b"
+)
+
 
 @dataclass(frozen=True)
 class ResolvedQuery:
@@ -95,6 +103,11 @@ def _mode() -> str:
 def is_product_uses_question(text: str) -> bool:
     """Nhận diện intent hỏi công dụng kể cả khi tên thuốc chưa resolve được."""
     return _PRODUCT_USES_RE.search(_fold(text)) is not None
+
+
+def is_product_dose_question(text: str) -> bool:
+    """Nhận diện intent hỏi liều dùng/ngày cách ly của một sản phẩm."""
+    return _PRODUCT_DOSE_RE.search(_fold(text)) is not None
 
 
 def _get_client():

@@ -37,3 +37,6 @@ pytest_cache/
 #Readme-Data
 data/README.md
 GIAI-PHAP.md
+
+# Credentials Google ADC — tuyệt đối không commit
+application_default_credentials.json
